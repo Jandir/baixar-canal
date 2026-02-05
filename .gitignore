@@ -1,0 +1,8 @@
+# Arquivos de sistema
+.DS_Store
+
+# Arquivos gerados pelo script
+historico.txt
+*.srt
+*.json
+*.vtt
