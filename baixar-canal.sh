@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION="1.8.2"
+VERSION="1.8.3"
 
 
 # Cores
@@ -10,6 +10,19 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
+
+# Configuração do ambiente Python local
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_EXEC="$SCRIPT_DIR/.venv/bin/python3"
+
+# Verifica se o venv existe, senão alerta
+if [ ! -x "$PYTHON_EXEC" ]; then
+  echo -e "${RED}ERRO: Ambiente virtual não encontrado em $PYTHON_EXEC${NC}"
+  echo "Por favor, execute a instalação das dependências no diretório do script."
+  exit 1
+fi
+
+YT_DLP_CMD="$PYTHON_EXEC -m yt_dlp"
 
 show_help() {
   echo -e "${BLUE}Uso:${NC} $0 [OPÇÕES] <ID_DO_CANAL>"
@@ -85,7 +98,7 @@ fi
 
 # Detecta a língua nativa do primeiro vídeo do canal
 echo -e "${YELLOW}Detectando idioma nativo do canal...${NC}"
-NATIVE_LANG=$(yt-dlp $COOKIE_ARGS --print "language" --playlist-end 1 "$URL_FINAL" 2>/dev/null)
+NATIVE_LANG=$($YT_DLP_CMD $COOKIE_ARGS --print "language" --playlist-end 1 "$URL_FINAL" 2>/dev/null)
 
 if [ -z "$LANG_OPT" ]; then
   if [ -n "$NATIVE_LANG" ]; then
@@ -103,7 +116,7 @@ fi
 
 # 1. Obter lista de IDs dos vídeos
 echo -e "${YELLOW}Obtendo lista de vídeos do canal (isso pode demorar um pouco)...${NC}"
-VIDEO_IDS=$(yt-dlp $COOKIE_ARGS --flat-playlist --print id "$URL_FINAL" --ignore-errors)
+VIDEO_IDS=$($YT_DLP_CMD $COOKIE_ARGS --flat-playlist --print id "$URL_FINAL" --ignore-errors)
 
 if [ -z "$VIDEO_IDS" ]; then
   echo -e "${RED}Nenhum vídeo encontrado ou erro ao acessar o canal.${NC}"
@@ -128,7 +141,7 @@ for VID_ID in $VIDEO_IDS; do
   echo -e "${BLUE}[$CURRENT/$TOTAL_VIDEOS]${NC} Baixando legendas para: ${CYAN}$VID_ID${NC} ($LANG_OPT)"
 
   # Executa yt-dlp para um único vídeo
-  yt-dlp \
+  $YT_DLP_CMD \
     --js-runtimes node:"/Users/jandirp/.nvm/versions/node/v22.16.0/bin/node" \
     --ignore-no-formats-error \
     --write-auto-sub \
