@@ -1,5 +1,12 @@
 #!/bin/bash
 
+#
+# Script: baixar-canal.sh
+# Descrição: Baixa legendas de todos os vídeos de um canal do YouTube.
+#            O objetivo original é utilizar estas legendas como fontes no NotebookLM,
+#            para alavancar estudos sobre determinado autor ou assunto.
+#
+
 VERSION="1.8.3"
 
 
@@ -183,7 +190,7 @@ for VID_ID in $VIDEO_IDS; do
     fi
 
     # Sucesso: esperar tempo padrão estendido (30 a 60s)
-    SLEEP_VAL=$(python3 -c 'import random; print(random.randint(10, 30))')
+    SLEEP_VAL=$(python3 -c 'import random; print(random.randint(1, 5))')
     countdown "$SLEEP_VAL" "${GREEN}Sucesso!${NC} Aguardando"
   else
     # Falha: possível 429 ou outro erro. Esperar 5 minutos.
