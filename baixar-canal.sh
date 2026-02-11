@@ -7,7 +7,7 @@
 #            para alavancar estudos sobre determinado autor ou assunto.
 #
 
-VERSION="1.8.3"
+VERSION="1.8.4"
 
 
 # Cores
@@ -38,8 +38,13 @@ show_help() {
   echo "  Baixa legendas de todos os vídeos de um canal do YouTube."
   echo "  Versão: $VERSION"
   echo ""
+  echo -e "${BLUE}Padrão de nome dos arquivos:${NC}"
+  echo "  [NOME_DA_PASTA]-[ID_VIDEO]-[LANG].srt"
+  echo ""
   echo -e "${BLUE}Opções:${NC}"
   echo "  -l, --lang <LANG>  Idioma das legendas (ex: pt, en). Padrão: idioma nativo do canal"
+  echo "  -d, --date <DATA>  Data limite (posterior a). Formato: YYYYMMDD ou strings como 'now-1week'"
+  echo "  -f, --fast         Modo rápido: pula o tempo de espera entre downloads"
   echo "  -v, --version      Mostra a versão do script"
   echo "  -h, --help         Mostra esta mensagem de ajuda"
   echo ""
@@ -62,12 +67,16 @@ countdown() {
 
 LANG_OPT=""
 ID_DO_CANAL=""
+FAST_MODE=false
+DATE_LIMIT=""
 
 while [[ "$#" -gt 0 ]]; do
   case $1 in
     -h|--help) show_help; exit 0 ;;
     -v|--version) echo "Versão: $VERSION"; exit 0 ;;
     -l|--lang) LANG_OPT="$2"; shift ;;
+    -d|--date) DATE_LIMIT="$2"; shift ;;
+    -f|--fast) FAST_MODE=true ;;
     *) ID_DO_CANAL="$1" ;;
   esac
   shift
@@ -89,6 +98,8 @@ fi
 
 # Define o caminho travado na pasta atual
 ARQUIVO_TRAVADO="$(pwd)/historico.txt"
+CURRENT_FOLDER=$(basename "$(pwd)")
+
 
 echo -e "${BLUE}Usando arquivo de histórico em:${NC} $ARQUIVO_TRAVADO"
 echo -e "${BLUE}Processando canal:${NC} $URL_FINAL"
@@ -123,7 +134,12 @@ fi
 
 # 1. Obter lista de IDs dos vídeos
 echo -e "${YELLOW}Obtendo lista de vídeos do canal (isso pode demorar um pouco)...${NC}"
-VIDEO_IDS=$($YT_DLP_CMD $COOKIE_ARGS --flat-playlist --print id "$URL_FINAL" --ignore-errors)
+DATE_ARGS=()
+if [ -n "$DATE_LIMIT" ]; then
+  echo -e "${YELLOW}Filtrando por data: vídeos a partir de $DATE_LIMIT${NC}"
+  DATE_ARGS=(--dateafter "$DATE_LIMIT")
+fi
+VIDEO_IDS=$($YT_DLP_CMD $COOKIE_ARGS "${DATE_ARGS[@]}" --flat-playlist --print id "$URL_FINAL" --ignore-errors)
 
 if [ -z "$VIDEO_IDS" ]; then
   echo -e "${RED}Nenhum vídeo encontrado ou erro ao acessar o canal.${NC}"
@@ -140,9 +156,17 @@ for VID_ID in $VIDEO_IDS; do
   CURRENT=$((CURRENT + 1))
   
   # Verifica se já está no histórico
+  ARCHIVE_ARGS=(--download-archive "$ARQUIVO_TRAVADO")
+  
+  # Verifica se já está no histórico
   if [ -f "$ARQUIVO_TRAVADO" ] && grep -q "youtube $VID_ID" "$ARQUIVO_TRAVADO"; then
-    echo -e "${BLUE}[$CURRENT/$TOTAL_VIDEOS]${NC} Vídeo $VID_ID já está no histórico. ${YELLOW}Pulando...${NC}"
-    continue
+    if [ ! -f "${CURRENT_FOLDER}-${VID_ID}.info.json" ]; then
+      echo -e "${BLUE}[$CURRENT/$TOTAL_VIDEOS]${NC} Vídeo $VID_ID no histórico, mas JSON ausente. ${YELLOW}Baixando metadados...${NC}"
+      ARCHIVE_ARGS=()
+    else
+      echo -e "${BLUE}[$CURRENT/$TOTAL_VIDEOS]${NC} Vídeo $VID_ID já está no histórico. ${YELLOW}Pulando...${NC}"
+      continue
+    fi
   fi
 
   echo -e "${BLUE}[$CURRENT/$TOTAL_VIDEOS]${NC} Baixando legendas para: ${CYAN}$VID_ID${NC} ($LANG_OPT)"
@@ -156,9 +180,9 @@ for VID_ID in $VIDEO_IDS; do
     --write-info-json \
     --skip-download \
     $COOKIE_ARGS \
-    --download-archive "$ARQUIVO_TRAVADO" \
+    "${ARCHIVE_ARGS[@]}" \
     --sub-langs "$LANG_OPT" \
-    -o "%(id)s" \
+    -o "${CURRENT_FOLDER}-%(id)s" \
     "https://www.youtube.com/watch?v=$VID_ID"
 
   EXIT_CODE=$?
@@ -166,7 +190,7 @@ for VID_ID in $VIDEO_IDS; do
   if [ $EXIT_CODE -eq 0 ]; then
     # Sucesso: Limpar legendas duplicadas se houver
     shopt -s nullglob
-    LEGENDA_FILES=("${VID_ID}"*.srt)
+    LEGENDA_FILES=("${CURRENT_FOLDER}-${VID_ID}"*.srt)
     shopt -u nullglob
 
     if [ ${#LEGENDA_FILES[@]} -gt 1 ]; then
@@ -186,16 +210,46 @@ for VID_ID in $VIDEO_IDS; do
           rm "$ARQ"
         fi
       done
-      echo -e "${GREEN}Legenda mantida:${NC} $MELHOR_ARQ"
+      
+      # Atualiza a variável para o arquivo sobrevivente se a lógica de renomeação precisar
+      FINAL_FILE="$MELHOR_ARQ"
+    elif [ ${#LEGENDA_FILES[@]} -eq 1 ]; then
+      FINAL_FILE="${LEGENDA_FILES[0]}"
     fi
 
-    # Sucesso: esperar tempo padrão estendido (30 a 60s)
-    SLEEP_VAL=$(python3 -c 'import random; print(random.randint(1, 5))')
-    countdown "$SLEEP_VAL" "${GREEN}Sucesso!${NC} Aguardando"
+    # Renomear para substituir ponto por hífen antes da linguagem (ex: .pt.srt -> -pt.srt)
+    if [ -n "$FINAL_FILE" ] && [ -f "$FINAL_FILE" ]; then
+      # Padrão esperado do yt-dlp: FOLDER-ID.lang.srt
+      # Queremos: FOLDER-ID-lang.srt
+      # Verifica se tem ponto antes da linguagem (último ponto antes de .srt)
+      if [[ "$FINAL_FILE" == *.*.srt ]]; then
+        BASE_PREFIX="${CURRENT_FOLDER}-${VID_ID}"
+        # Remove o prefixo para pegar .lang.srt
+        SUFFIX="${FINAL_FILE#$BASE_PREFIX}"
+        # Se sufixo começar com ponto, substitui por hífen
+        if [[ "$SUFFIX" == .* ]]; then
+           NEW_SUFFIX="-${SUFFIX#.}"
+           NEW_NAME="${BASE_PREFIX}${NEW_SUFFIX}"
+           mv "$FINAL_FILE" "$NEW_NAME"
+           FINAL_FILE="$NEW_NAME"
+        fi
+      fi
+      echo -e "${GREEN}Legenda mantida:${NC} $FINAL_FILE"
+    fi
+
+    # Sucesso: esperar tempo padrão (1 a 5s), a menos que --fast
+    if [ "$FAST_MODE" = false ]; then
+      SLEEP_VAL=$(python3 -c 'import random; print(random.randint(1, 5))')
+      countdown "$SLEEP_VAL" "${GREEN}Sucesso!${NC} Aguardando"
+    else
+      echo -e "${GREEN}Sucesso!${NC} (modo rápido)"
+    fi
   else
-    # Falha: possível 429 ou outro erro. Esperar 5 minutos.
+    # Falha: possível 429 ou outro erro. Esperar 5 minutos, a menos que --fast.
     echo -e "${RED}AVISO: Falha no download (código $EXIT_CODE). Possível bloqueio temporário (429).${NC}"
-    countdown 300 "${YELLOW}Entrando em modo de resfriamento. Aguardando${NC}"
+    if [ "$FAST_MODE" = false ]; then
+      countdown 300 "${YELLOW}Entrando em modo de resfriamento. Aguardando${NC}"
+    fi
     echo -e "${GREEN}Retomando...${NC}"
   fi
 done
