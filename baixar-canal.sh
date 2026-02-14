@@ -43,13 +43,15 @@ show_help() {
   echo ""
   echo -e "${BLUE}Opções:${NC}"
   echo "  -l, --lang <LANG>  Idioma das legendas (ex: pt, en). Padrão: idioma nativo do canal"
-  echo "  -d, --date <DATA>  Data limite (posterior a). Formato: YYYYMMDD ou strings como 'now-1week'"
-  echo "  -f, --fast         Modo rápido: pula o tempo de espera entre downloads"
-  echo "  -v, --version      Mostra a versão do script"
-  echo "  -h, --help         Mostra esta mensagem de ajuda"
+  echo "  -a, --audio-only       Baixa APENAS o áudio do vídeo (webm/opus), sem legendas"
+  echo "  -d, --date <DATA>      Data limite (posterior a). Formato: YYYYMMDD ou strings como 'now-1week'"
+  echo "  -rc, --refresh-cookies  Força a extração de novos cookies do Chrome (apaga cookies.txt existente)"
+  echo "  -f, --fast             Modo rápido: pula o tempo de espera entre downloads"
+  echo "  -v, --version          Mostra a versão do script"
+  echo "  -h, --help             Mostra esta mensagem de ajuda"
   echo ""
   echo -e "${BLUE}Exemplo:${NC}"
-  echo "  $0 --lang pt UCNzyuo5w8fTte9fRZLDqJUg"
+  echo "  $0 --lang pt --refresh-cookies UCNzyuo5w8fTte9fRZLDqJUg"
 }
 
 # Função de contagem regressiva
@@ -69,6 +71,8 @@ LANG_OPT=""
 ID_DO_CANAL=""
 FAST_MODE=false
 DATE_LIMIT=""
+AUDIO_ONLY=false
+REFRESH_COOKIES=false
 
 while [[ "$#" -gt 0 ]]; do
   case $1 in
@@ -76,6 +80,8 @@ while [[ "$#" -gt 0 ]]; do
     -v|--version) echo "Versão: $VERSION"; exit 0 ;;
     -l|--lang) LANG_OPT="$2"; shift ;;
     -d|--date) DATE_LIMIT="$2"; shift ;;
+    -a|--audio-only) AUDIO_ONLY=true ;;
+    -rc|--refresh-cookies) REFRESH_COOKIES=true ;;
     -f|--fast) FAST_MODE=true ;;
     *) ID_DO_CANAL="$1" ;;
   esac
@@ -106,19 +112,25 @@ echo -e "${BLUE}Processando canal:${NC} $URL_FINAL"
 
 # Configuração de Cookies
 COOKIES_FILE="cookies.txt"
+
+if [ "$REFRESH_COOKIES" = true ]; then
+    echo -e "${YELLOW}Forçando atualização de cookies (--refresh-cookies). Apagando cache antigo...${NC}"
+    rm -f "$COOKIES_FILE"
+fi
+
 if [ -f "$COOKIES_FILE" ]; then
   echo -e "${YELLOW}Usando cookies em cache: ${COOKIES_FILE}${NC}"
   COOKIE_ARGS="--cookies $COOKIES_FILE"
 else
-  echo -e "${YELLOW}Cookies em cache não encontrados. Extraindo do navegador e salvando em: ${COOKIES_FILE}${NC}"
+  echo -e "${YELLOW}Cookies em cache não encontrados (ou forçados a renovar). Extraindo do navegador e salvando em: ${COOKIES_FILE}${NC}"
   COOKIE_ARGS="--cookies-from-browser chrome --cookies $COOKIES_FILE"
 fi
 
-# Detecta a língua nativa do primeiro vídeo do canal
-echo -e "${YELLOW}Detectando idioma nativo do canal...${NC}"
-NATIVE_LANG=$($YT_DLP_CMD $COOKIE_ARGS --print "language" --playlist-end 1 "$URL_FINAL" 2>/dev/null)
-
 if [ -z "$LANG_OPT" ]; then
+  # Detecta a língua nativa do primeiro vídeo do canal
+  echo -e "${YELLOW}Detectando idioma nativo do canal...${NC}"
+  NATIVE_LANG=$($YT_DLP_CMD $COOKIE_ARGS --print "language" --playlist-end 1 "$URL_FINAL" 2>/dev/null)
+
   if [ -n "$NATIVE_LANG" ]; then
     # Usa strict match para evitar múltiplas variações e economizar requisições
     # Regex ^...$ garante que pegamos apenas o que foi detectado ou solicitado
@@ -130,6 +142,8 @@ if [ -z "$LANG_OPT" ]; then
     echo "Isso evita o download desnecessário de todas as línguas disponíveis."
     exit 1
   fi
+else
+    echo -e "${GREEN}Idioma definido pelo usuário:${NC} $LANG_OPT (Ignorando detecção automática)"
 fi
 
 # 1. Obter lista de IDs dos vídeos
@@ -169,72 +183,76 @@ for VID_ID in $VIDEO_IDS; do
     fi
   fi
 
-  echo -e "${BLUE}[$CURRENT/$TOTAL_VIDEOS]${NC} Baixando legendas para: ${CYAN}$VID_ID${NC} ($LANG_OPT)"
+  if [ "$AUDIO_ONLY" = true ]; then
+    echo -e "${BLUE}[$CURRENT/$TOTAL_VIDEOS]${NC} Baixando ÁUDIO para: ${CYAN}$VID_ID${NC}"
+  else
+    echo -e "${BLUE}[$CURRENT/$TOTAL_VIDEOS]${NC} Baixando LEGENDAS para: ${CYAN}$VID_ID${NC} ($LANG_OPT)"
+  fi
 
   # Executa yt-dlp para um único vídeo
   $YT_DLP_CMD \
     --js-runtimes node:"/Users/jandirp/.nvm/versions/node/v22.16.0/bin/node" \
     --ignore-no-formats-error \
-    --write-auto-sub \
-    --convert-subs srt \
     --write-info-json \
-    --skip-download \
+    $(if [ "$AUDIO_ONLY" = true ]; then echo "-f ba[ext=webm]"; else echo "--skip-download --write-auto-sub --convert-subs srt"; fi) \
     $COOKIE_ARGS \
     "${ARCHIVE_ARGS[@]}" \
     --sub-langs "$LANG_OPT" \
-    -o "${CURRENT_FOLDER}-%(id)s" \
+    -o "${CURRENT_FOLDER}-%(id)s$(if [ "$AUDIO_ONLY" = true ]; then echo ".%(ext)s"; fi)" \
     "https://www.youtube.com/watch?v=$VID_ID"
 
   EXIT_CODE=$?
 
   if [ $EXIT_CODE -eq 0 ]; then
-    # Sucesso: Limpar legendas duplicadas se houver
-    shopt -s nullglob
-    LEGENDA_FILES=("${CURRENT_FOLDER}-${VID_ID}"*.srt)
-    shopt -u nullglob
+    if [ "$AUDIO_ONLY" = false ]; then
+      # Sucesso: Limpar legendas duplicadas se houver
+      shopt -s nullglob
+      LEGENDA_FILES=("${CURRENT_FOLDER}-${VID_ID}"*.srt)
+      shopt -u nullglob
 
-    if [ ${#LEGENDA_FILES[@]} -gt 1 ]; then
-      echo -e "${YELLOW}Detectadas ${#LEGENDA_FILES[@]} variações de legenda. Mantendo apenas uma...${NC}"
-      
-      MELHOR_ARQ="${LEGENDA_FILES[0]}"
-      
-      for ARQ in "${LEGENDA_FILES[@]}"; do
-        # Critério: menor nome de arquivo (preferência por "pt" sobre "pt-BR")
-        if [ ${#ARQ} -lt ${#MELHOR_ARQ} ]; then
-          MELHOR_ARQ="$ARQ"
-        fi
-      done
-      
-      for ARQ in "${LEGENDA_FILES[@]}"; do
-        if [ "$ARQ" != "$MELHOR_ARQ" ]; then
-          rm "$ARQ"
-        fi
-      done
-      
-      # Atualiza a variável para o arquivo sobrevivente se a lógica de renomeação precisar
-      FINAL_FILE="$MELHOR_ARQ"
-    elif [ ${#LEGENDA_FILES[@]} -eq 1 ]; then
-      FINAL_FILE="${LEGENDA_FILES[0]}"
-    fi
-
-    # Renomear para substituir ponto por hífen antes da linguagem (ex: .pt.srt -> -pt.srt)
-    if [ -n "$FINAL_FILE" ] && [ -f "$FINAL_FILE" ]; then
-      # Padrão esperado do yt-dlp: FOLDER-ID.lang.srt
-      # Queremos: FOLDER-ID-lang.srt
-      # Verifica se tem ponto antes da linguagem (último ponto antes de .srt)
-      if [[ "$FINAL_FILE" == *.*.srt ]]; then
-        BASE_PREFIX="${CURRENT_FOLDER}-${VID_ID}"
-        # Remove o prefixo para pegar .lang.srt
-        SUFFIX="${FINAL_FILE#$BASE_PREFIX}"
-        # Se sufixo começar com ponto, substitui por hífen
-        if [[ "$SUFFIX" == .* ]]; then
-           NEW_SUFFIX="-${SUFFIX#.}"
-           NEW_NAME="${BASE_PREFIX}${NEW_SUFFIX}"
-           mv "$FINAL_FILE" "$NEW_NAME"
-           FINAL_FILE="$NEW_NAME"
-        fi
+      if [ ${#LEGENDA_FILES[@]} -gt 1 ]; then
+        echo -e "${YELLOW}Detectadas ${#LEGENDA_FILES[@]} variações de legenda. Mantendo apenas uma...${NC}"
+        
+        MELHOR_ARQ="${LEGENDA_FILES[0]}"
+        
+        for ARQ in "${LEGENDA_FILES[@]}"; do
+          # Critério: menor nome de arquivo (preferência por "pt" sobre "pt-BR")
+          if [ ${#ARQ} -lt ${#MELHOR_ARQ} ]; then
+            MELHOR_ARQ="$ARQ"
+          fi
+        done
+        
+        for ARQ in "${LEGENDA_FILES[@]}"; do
+          if [ "$ARQ" != "$MELHOR_ARQ" ]; then
+            rm "$ARQ"
+          fi
+        done
+        
+        # Atualiza a variável para o arquivo sobrevivente se a lógica de renomeação precisar
+        FINAL_FILE="$MELHOR_ARQ"
+      elif [ ${#LEGENDA_FILES[@]} -eq 1 ]; then
+        FINAL_FILE="${LEGENDA_FILES[0]}"
       fi
-      echo -e "${GREEN}Legenda mantida:${NC} $FINAL_FILE"
+
+      # Renomear para substituir ponto por hífen antes da linguagem (ex: .pt.srt -> -pt.srt)
+      if [ -n "$FINAL_FILE" ] && [ -f "$FINAL_FILE" ]; then
+        # Padrão esperado do yt-dlp: FOLDER-ID.lang.srt
+        # Queremos: FOLDER-ID-lang.srt
+        # Verifica se tem ponto antes da linguagem (último ponto antes de .srt)
+        if [[ "$FINAL_FILE" == *.*.srt ]]; then
+          BASE_PREFIX="${CURRENT_FOLDER}-${VID_ID}"
+          # Remove o prefixo para pegar .lang.srt
+          SUFFIX="${FINAL_FILE#$BASE_PREFIX}"
+          # Se sufixo começar com ponto, substitui por hífen
+          if [[ "$SUFFIX" == .* ]]; then
+             NEW_SUFFIX="-${SUFFIX#.}"
+             NEW_NAME="${BASE_PREFIX}${NEW_SUFFIX}"
+             mv "$FINAL_FILE" "$NEW_NAME"
+             FINAL_FILE="$NEW_NAME"
+          fi
+        fi
+        echo -e "${GREEN}Legenda mantida:${NC} $FINAL_FILE"
+      fi
     fi
 
     # Sucesso: esperar tempo padrão (1 a 5s), a menos que --fast
