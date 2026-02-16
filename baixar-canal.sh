@@ -7,8 +7,7 @@
 #            para alavancar estudos sobre determinado autor ou assunto.
 #
 
-VERSION="1.8.4"
-
+VERSION="1.8.5"
 
 # Cores
 RED='\033[0;31m'
@@ -104,6 +103,7 @@ fi
 
 # Define o caminho travado na pasta atual
 ARQUIVO_TRAVADO="$(pwd)/historico.txt"
+ARQUIVO_INFO="$(pwd)/historico-info.txt"
 CURRENT_FOLDER=$(basename "$(pwd)")
 
 
@@ -172,6 +172,14 @@ for VID_ID in $VIDEO_IDS; do
   # Verifica se já está no histórico
   ARCHIVE_ARGS=(--download-archive "$ARQUIVO_TRAVADO")
   
+  # Verifica se o ID consta em ambos os históricos (txt e info) - Pedido do usuário
+  if [ -f "$ARQUIVO_TRAVADO" ] && [ -f "$ARQUIVO_INFO" ]; then
+      if grep -q "youtube $VID_ID" "$ARQUIVO_TRAVADO" && grep -q "youtube $VID_ID" "$ARQUIVO_INFO"; then
+          echo -e "${BLUE}[$CURRENT/$TOTAL_VIDEOS]${NC} Vídeo $VID_ID já processado (historico + info). ${YELLOW}Pulando...${NC}"
+          continue
+      fi
+  fi
+  
   # Verifica se já está no histórico
   if [ -f "$ARQUIVO_TRAVADO" ] && grep -q "youtube $VID_ID" "$ARQUIVO_TRAVADO"; then
     if [ ! -f "${CURRENT_FOLDER}-${VID_ID}.info.json" ]; then
@@ -197,6 +205,7 @@ for VID_ID in $VIDEO_IDS; do
     $(if [ "$AUDIO_ONLY" = true ]; then echo "-f ba[ext=webm]"; else echo "--skip-download --write-auto-sub --convert-subs srt"; fi) \
     $COOKIE_ARGS \
     "${ARCHIVE_ARGS[@]}" \
+    "${DATE_ARGS[@]}" \
     --sub-langs "$LANG_OPT" \
     -o "${CURRENT_FOLDER}-%(id)s$(if [ "$AUDIO_ONLY" = true ]; then echo ".%(ext)s"; fi)" \
     "https://www.youtube.com/watch?v=$VID_ID"

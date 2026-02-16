@@ -5,8 +5,8 @@ Script em Shell Bash para baixar legendas (legendas automáticas ou manuais) de 
 ## Funcionalidades
 
 - **Download em Massa**: Processa todo o canal dado um ID.
-- **Controle de Rate Limit via Delay Inteligente**: Aguarda entre 10 e 30 segundos entre downloads bem-sucedidos para evitar bloqueios do YouTube (HTTP 429). Em caso de erro, aguarda 5 minutos (cool-down).
-- **Histórico de Downloads**: Mantém um arquivo `historico.txt` para pular vídeos já processados, permitindo interromper e retomar o processo sem downloads duplicados.
+- **Controle de Rate Limit via Delay Inteligente**: Aguarda entre 1 e 30 segundos entre downloads bem-sucedidos para evitar bloqueios do YouTube (HTTP 429). Em caso de erro, aguarda 5 minutos (cool-down). Esse delay pode ser pulado com a opção `--fast`.
+- **Histórico de Downloads**: Mantém um arquivo `historico.txt` para pular vídeos já processados, permitindo interromper e retomar o processo sem downloads duplicados e perda de tempo.
 - **Detecção de Idioma**: Tenta detectar o idioma nativo do canal automaticamente se não for especificado.
 - **Limpeza de Duplicatas**: Se houver múltiplas variações de legenda (ex: `pt` e `pt-BR`), mantém apenas a versão mais curta/simples.
 
@@ -49,9 +49,23 @@ Forçar idioma português (`pt`):
 ./baixar-canal.sh --lang pt UCNzyuo5w8fTte9fRZLDqJUg
 ```
 
+Baixar vídeos publicados após uma data específica:
+```bash
+./baixar-canal.sh --date 20240101 UCNzyuo5w8fTte9fRZLDqJUg
+```
+
+Modo somente áudio:
+```bash
+./baixar-canal.sh --audio-only UCNzyuo5w8fTte9fRZLDqJUg
+```
+
 ### Opções
 
 - `-l, --lang <LANG>`: Especifica o idioma das legendas (ex: `pt`, `en`). Padrão: detectado automaticamente.
+- `-a, --audio-only`: Baixa apenas áudio (webm), sem legendas. Pensado para canais muito antigos que não têm legendas ou as legendas estejam com baixa qualidade.
+- `-d, --date <DATA>`: Baixa vídeos publicados após a data (YYYYMMDD ou 'now-1week').
+- `-rc, --refresh-cookies`: Força renovação de cookies.
+- `-f, --fast`: Modo rápido (sem delay).
 - `-v, --version`: Mostra a versão do script.
 - `-h, --help`: Mostra a ajuda.
 
