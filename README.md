@@ -1,78 +1,100 @@
 # Baixar Canal
 
-Script em Shell Bash para baixar legendas (legendas automáticas ou manuais) de **todos** os vídeos de um canal do YouTube de forma sequencial e controlada.
+Script **Python** para baixar legendas (automáticas ou manuais) de todos os vídeos de um canal do YouTube de forma sequencial e controlada.
+
+> O script shell `baixar-canal.sh` foi substituído por `baixar-canal.py`. Use a versão Python para todos os novos downloads.
+
+---
 
 ## Funcionalidades
 
-- **Download em Massa**: Processa todo o canal dado um ID.
-- **Controle de Rate Limit via Delay Inteligente**: Aguarda entre 1 e 30 segundos entre downloads bem-sucedidos para evitar bloqueios do YouTube (HTTP 429). Em caso de erro, aguarda 5 minutos (cool-down). Esse delay pode ser pulado com a opção `--fast`.
-- **Histórico de Downloads**: Mantém um arquivo `historico.txt` para pular vídeos já processados, permitindo interromper e retomar o processo sem downloads duplicados e perda de tempo.
-- **Detecção de Idioma**: Tenta detectar o idioma nativo do canal automaticamente se não for especificado.
-- **Limpeza de Duplicatas**: Se houver múltiplas variações de legenda (ex: `pt` e `pt-BR`), mantém apenas a versão mais curta/simples.
+- **Download em massa** — processa todo o canal a partir de um ID ou URL.
+- **Ordenação por data** — busca IDs e datas de upload via `--flat-playlist --dump-json`; processa do mais novo para o mais antigo.
+- **Histórico de downloads** — arquivo `historico.txt` gerado automaticamente; retomada sem duplicatas.
+- **Detecção de idioma** — detecta o idioma nativo do canal automaticamente se não especificado.
+- **Controle de rate limit** — aguarda 1–5 s entre downloads; em caso de erro (429), entra em resfriamento de 5 min.
+- **Limpeza de legendas** — mantém apenas a variação mais simples (ex: `pt` em vez de `pt-BR`).
+- **Cookies em cache** — extrai cookies do Chrome uma única vez por sessão e reutiliza `cookies.txt`.
+- **Interrupção limpa** — Ctrl+C encerra o processo `yt-dlp` filho antes de sair.
+
+---
 
 ## Pré-requisitos
 
-- **[yt-dlp](https://github.com/yt-dlp/yt-dlp)**: Ferramenta principal de download.
-- **Python 3**: Usado para gerar tempos de espera aleatórios.
-- **Bash**: Shell padrão (testado em macOS/Linux).
+| Dependência | Uso |
+|---|---|
+| **Python 3.10+** | Runtime principal |
+| **yt-dlp** | Download de legendas/áudio (instalado no venv) |
+| **Node.js** | JS runtime para o yt-dlp |
+| **Chrome** | Extração de cookies de autenticação |
+
+---
 
 ## Instalação
 
-1. Clone este repositório:
-   ```bash
-   git clone https://github.com/SEU_USUARIO/baixar-canal.git
-   cd baixar-canal
-   ```
+```bash
+# 1. Criar o ambiente virtual e instalar o yt-dlp
+cd baixar-canal
+python3 -m venv .venv
+.venv/bin/pip install yt-dlp
 
-2. Dê permissão de execução ao script:
-   ```bash
-   chmod +x baixar-canal.sh
-   ```
+# 2. (Opcional) Criar alias no ~/.zshrc
+echo 'alias baixar="python3 /caminho/para/baixar-canal.py"' >> ~/.zshrc
+```
+
+---
 
 ## Uso
 
-Execute o script passando o ID do canal ou a URL do canal:
-
 ```bash
-./baixar-canal.sh [OPÇÕES] <ID_DO_CANAL>
+python3 baixar-canal.py [OPÇÕES] <ID_DO_CANAL_OU_URL>
+# ou, com o alias:
+baixar [OPÇÕES] <ID_DO_CANAL_OU_URL>
 ```
 
 ### Exemplos
 
-Baixar legendas do canal (detecta idioma automaticamente):
 ```bash
-./baixar-canal.sh UCNzyuo5w8fTte9fRZLDqJUg
-```
+# Detectar idioma automaticamente
+baixar @FilipeDeschamps
 
-Forçar idioma português (`pt`):
-```bash
-./baixar-canal.sh --lang pt UCNzyuo5w8fTte9fRZLDqJUg
-```
+# Forçar idioma (evita chamada extra ao YouTube)
+baixar -l pt @FilipeDeschamps
 
-Baixar vídeos publicados após uma data específica:
-```bash
-./baixar-canal.sh --date 20240101 UCNzyuo5w8fTte9fRZLDqJUg
-```
+# Baixar somente vídeos publicados após a data
+baixar -d 20250101 @FilipeDeschamps
 
-Modo somente áudio:
-```bash
-./baixar-canal.sh --audio-only UCNzyuo5w8fTte9fRZLDqJUg
+# Modo somente áudio (webm/opus)
+baixar -a @FilipeDeschamps
+
+# Renovar cookies + modo rápido
+baixar -rc -f @FilipeDeschamps
 ```
 
 ### Opções
 
-- `-l, --lang <LANG>`: Especifica o idioma das legendas (ex: `pt`, `en`). Padrão: detectado automaticamente.
-- `-a, --audio-only`: Baixa apenas áudio (webm), sem legendas. Pensado para canais muito antigos que não têm legendas ou as legendas estejam com baixa qualidade.
-- `-d, --date <DATA>`: Baixa vídeos publicados após a data (YYYYMMDD ou 'now-1week').
-- `-rc, --refresh-cookies`: Força renovação de cookies.
-- `-f, --fast`: Modo rápido (sem delay).
-- `-v, --version`: Mostra a versão do script.
-- `-h, --help`: Mostra a ajuda.
+| Opção | Descrição |
+|---|---|
+| `-l, --lang <LANG>` | Idioma das legendas (`pt`, `en`, …). Padrão: detectado automaticamente |
+| `-a, --audio-only` | Baixa apenas o áudio (webm/opus), sem legendas |
+| `-d, --date <YYYYMMDD>` | Filtra vídeos publicados **após** a data informada |
+| `-rc, --refresh-cookies` | Força renovação dos cookies (apaga `cookies.txt` existente) |
+| `-f, --fast` | Modo rápido: sem delay entre downloads |
+| `-v, --version` | Exibe a versão |
+| `-h, --help` | Exibe a ajuda |
 
-## Notas
+---
 
-- O script utiliza cookies do navegador Chrome (`--cookies-from-browser chrome`) para contornar algumas restrições. Certifique-se de ter o Chrome instalado ou ajuste o script conforme necessário.
-- O arquivo `historico.txt` é gerado na pasta onde o script é executado.
+## Arquivos gerados
+
+| Arquivo | Descrição |
+|---|---|
+| `historico.txt` | IDs já processados (formato yt-dlp archive) |
+| `cookies.txt` | Cookies do Chrome em cache (reutilizados na sessão) |
+| `<pasta>-<id>-<lang>.srt` | Legenda do vídeo |
+| `<pasta>-<id>.info.json` | Metadados do vídeo |
+
+---
 
 ## Licença
 
