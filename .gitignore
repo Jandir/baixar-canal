@@ -1,8 +1,4 @@
-# Arquivos de sistema
-.DS_Store
-
-# Arquivos gerados pelo script
-historico.txt
-*.srt
-*.json
-*.vtt
+cookies.txt
+renomear-legendas.sh
+baixar-canal.sh
+__pycache__/
