@@ -4,6 +4,8 @@ Script: baixar-canal.py
 Descrição: Baixa legendas de todos os vídeos de um canal do YouTube.
            O objetivo original é utilizar estas legendas como fontes no NotebookLM,
            para alavancar estudos sobre determinado autor ou assunto.
+           Vídeos sem legenda são registrados em 'videos_sem_legenda.txt' e ignorados
+           em execuções futuras para otimizar o processo.
 """
 
 import argparse
@@ -212,6 +214,26 @@ def load_archive(path: Path) -> set[str]:
     return ids
 
 
+def load_sem_legenda(cwd: Path) -> set[str]:
+    """
+    Carrega o arquivo 'videos_sem_legenda.txt' e retorna um set de IDs.
+    O formato do arquivo é: https://www.youtube.com/watch?v=ID
+    """
+    path = cwd / "videos_sem_legenda.txt"
+    if not path.is_file():
+        return set()
+    
+    ids: set[str] = set()
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if "watch?v=" in line:
+                vid_id = line.split("watch?v=")[-1].strip()
+                if vid_id:
+                    ids.add(vid_id)
+    return ids
+
+
 # ─── Listagem de IDs ──────────────────────────────────────────────────────────
 
 def load_dates_from_json(cwd: Path) -> dict[str, str]:
@@ -329,17 +351,18 @@ def get_video_ids(
 
 # ─── Pós-processamento de Legendas ────────────────────────────────────────────
 
-def cleanup_subtitles(cwd: Path, folder_name: str, vid_id: str) -> None:
+def cleanup_subtitles(cwd: Path, folder_name: str, vid_id: str) -> bool:
     """
     Remove variações duplicadas de legenda geradas pelo yt-dlp,
     mantendo apenas o arquivo com o menor nome (ex: prefere 'pt' sobre 'pt-BR').
     Renomeia de '.pt.srt' para '-pt.srt'.
+    Retorna True se processou alguma legenda, caso contrário False.
     """
     pattern = str(cwd / f"{folder_name}-{vid_id}*.srt")
     legenda_files = glob.glob(pattern)
 
     if not legenda_files:
-        return
+        return False
 
     if len(legenda_files) > 1:
         warn(f"{len(legenda_files)} variações de legenda detectadas — mantendo apenas uma.")
@@ -362,6 +385,7 @@ def cleanup_subtitles(cwd: Path, folder_name: str, vid_id: str) -> None:
         final_file = new_name
 
     info(f"Legenda salva: {DIM}{final_file.name}{RESET}")
+    return True
 
 
 # ─── Download Individual ──────────────────────────────────────────────────────
@@ -374,6 +398,7 @@ def download_video(
     lang_opt: str,
     folder_name: str,
     audio_only: bool,
+    output_dir: Path | None = None,
 ) -> int:
     """
     Executa o yt-dlp para baixar legendas ou áudio de um único vídeo.
@@ -382,6 +407,9 @@ def download_video(
     output_tmpl = f"{folder_name}-%(id)s"
     if audio_only:
         output_tmpl += ".%(ext)s"
+        
+    if output_dir:
+        output_tmpl = str(output_dir / output_tmpl)
 
     cmd = (
         yt_dlp_cmd
@@ -417,7 +445,9 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Baixa legendas de todos os vídeos de um canal do YouTube.\n"
             f"Versão: {VERSION}\n\n"
-            "Padrão de nome dos arquivos: [NOME_DA_PASTA]-[ID_VIDEO]-[LANG].srt"
+            "Padrão de nome dos arquivos: [NOME_DA_PASTA]-[ID_VIDEO]-[LANG].srt\n"
+            "Vídeos que não contêm legendas são registrados em 'videos_sem_legenda.txt'\n"
+            "na pasta do canal e serão automaticamente ignorados nas próximas execuções."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -457,7 +487,7 @@ def main() -> None:
         mode_label += "  ·  rápido"
     header(canal, VERSION, mode_label)
 
-    # Arquivos de histórico (sempre na pasta atual)
+    # Arquivos de histórico e controle (sempre na pasta de trabalho atual)
     arquivo_historico = cwd / "historico.txt"
     arquivo_info = cwd / "historico-info.txt"
 
@@ -494,7 +524,8 @@ def main() -> None:
     # Pré-carrega os históricos como sets (O(1) lookup por iteração)
     historico_ids = load_archive(arquivo_historico)
     info_ids      = load_archive(arquivo_info)
-    info(f"Histórico: {len(historico_ids)} em historico.txt · {len(info_ids)} em historico-info.txt")
+    sem_legenda_ids = load_sem_legenda(cwd)
+    info(f"Histórico: {len(historico_ids)} em historico.txt · {len(info_ids)} em historico-info.txt · {len(sem_legenda_ids)} sem legenda")
 
     # Contadores de sessão
     n_skip = n_ok = n_err = 0
@@ -508,6 +539,13 @@ def main() -> None:
         # Verificação dupla de histórico (O(1) — busca em set, não em arquivo)
         in_historico = vid_id in historico_ids
         in_info      = vid_id in info_ids
+        in_sem_legenda = vid_id in sem_legenda_ids
+
+        # Se já tá na lista de sem legenda, apenas pula com mensagem visual
+        if in_sem_legenda and not args.audio_only:
+            n_skip += 1
+            print(f"{prefix} {SKIP} {DIM}{vid_id}{RESET}  {DIM}marcado como sem legenda{RESET}")
+            continue
 
         if in_historico and in_info:
             n_skip += 1
@@ -541,19 +579,54 @@ def main() -> None:
         )
 
         if exit_code == 0:
-            n_ok += 1
             # Atualiza os sets em memória para evitar re-download no mesmo run
             historico_ids.add(vid_id)
             info_ids.add(vid_id)
 
-            if not args.audio_only:
-                cleanup_subtitles(cwd, folder_name, vid_id)
+            # Adiciona manualmente aos arquivos de histórico reais para evitar retry
+            with open(arquivo_historico, "a") as f:
+                f.write(f"youtube {vid_id}\n")
+            with open(arquivo_info, "a") as f:
+                f.write(f"youtube {vid_id}\n")
 
-            if not args.fast:
-                sleep_val = random.randint(1, 5)
-                countdown(sleep_val, "Aguardando")
+            has_subtitle = True
+            if not args.audio_only:
+                has_subtitle = cleanup_subtitles(cwd, folder_name, vid_id)
+
+            if not has_subtitle:
+                print(f"         {WARN} {BYELLW}sem legenda — baixando áudio fallback{RESET}")
+                
+                audios_dir = cwd / "audios"
+                audios_dir.mkdir(exist_ok=True)
+                
+                audio_exit_code = download_video(
+                    yt_dlp_cmd=yt_dlp_cmd,
+                    cookie_args=cookie_args,
+                    archive_args=[],  # Não tentar usar historico agora
+                    vid_id=vid_id,
+                    lang_opt=lang_opt,
+                    folder_name=folder_name,
+                    audio_only=True,
+                    output_dir=audios_dir,
+                )
+                
+                if audio_exit_code == 0:
+                    print(f"         {OK} {DIM}áudio fallback salvo em audios/{RESET}")
+                else:
+                    print(f"         {ERR} {BRED}falha ao baixar áudio fallback{RESET}")
+
+                n_skip += 1
+                with open(cwd / "videos_sem_legenda.txt", "a") as f:
+                    f.write(f"https://www.youtube.com/watch?v={vid_id}\n")
+                if not args.fast:
+                    countdown(1, "Aguardando")
             else:
-                print(f"         {OK} {DIM}ok{RESET}")
+                n_ok += 1
+                if not args.fast:
+                    sleep_val = random.randint(1, 5)
+                    countdown(sleep_val, "Aguardando")
+                else:
+                    print(f"         {OK} {DIM}ok{RESET}")
         else:
             n_err += 1
             print(f"         {ERR} {BRED}falha (código {exit_code}) — possível bloqueio 429{RESET}")
