@@ -1,0 +1,6 @@
+pysrt
+scikit-learn
+numpy
+nltk
+yt-dlp
+python-dotenv
