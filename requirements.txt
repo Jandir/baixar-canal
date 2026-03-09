@@ -2,5 +2,17 @@ pysrt
 scikit-learn
 numpy
 nltk
-yt-dlp
 python-dotenv
+
+# Dependência principal com extras
+yt-dlp[default,curl-cffi]>=2024.03.10
+
+# Trava de segurança para o macOS Monterey
+# Impede o download da versão 0.14+ que exige compilação avançada
+curl-cffi>=0.5.10,<=0.7.3
+
+# Dependências de suporte (Opcionais, mas recomendadas para evitar avisos)
+certifi>=2024.2.2
+mutagen>=1.47.0
+pycryptodomex>=3.20.0
+websockets>=12.0
