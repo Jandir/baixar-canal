@@ -14,7 +14,7 @@ Principais Funcionalidades:
    `escriba_*.json` (metadados e legendas), centralizando o estado da sessão.
 2. Controle de Ausência: Registra status `has_no_subtitle` no JSON de estado
    para evitar novas tentativas de extração futuramente.
-3. Tratamento de Formatção e Limpeza: Baixa e salva `.srt` ou converte para `.txt` limpo.
+3. Tratamento de Formatação e Limpeza: Baixa `.srt` e gera `.md` estruturado por IA.
 4. Interface Visual Rica (CLI): Fornece cores semânticas e contadores de tempo e status.
 
 Este script segue as regras de Clean Code Naming para Ekklezia: variáveis
@@ -33,13 +33,14 @@ import shutil
 import subprocess
 import sys
 import time
+import functools
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
-VERSION = "2.1.4"
+VERSION = "2.2.0"
 
 
 @dataclass
@@ -313,8 +314,17 @@ def generate_fast_list_json(
     channel_url: str,
     max_workers_count: int = 40
 ) -> list[dict]:
-    """Descobre IDs nativos via --flat-playlist e busca datas em paralelo, montando a base de rastreamento JSON."""
-    print_info(f"Fase 1: Descoberta de IDs ({BOLD}{channel_url}{RESET})...")
+    """
+    Novo mecanismo de descoberta de alta velocidade:
+    
+    Fase 1 — Extrai id, title e upload_date diretamente do stream JSON do 
+             --flat-playlist. Isso evita a necessidade de abrir múltiplos 
+             processos yt-dlp apenas para buscar metadados básicos.
+    
+    Fase 2 — Fallback paralelo (threads) acionado apenas para vídeos onde
+             o campo 'upload_date' estiver ausente no índice (raro).
+    """
+    print_info(f"Fase 1: Descoberta de IDs + Metadados ({BOLD}{channel_url}{RESET})...")
     discovery_cmd_list = yt_dlp_cmd_list + cookie_args_list + [
         "--flat-playlist",
         "--dump-json",
@@ -323,72 +333,100 @@ def generate_fast_list_json(
         channel_url
     ]
     
-    raw_video_list = []
+    raw_video_list: list[dict] = []
     try:
-        discovery_process = subprocess.Popen(discovery_cmd_list, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        discovery_process = subprocess.Popen(
+            discovery_cmd_list, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+        )
         for line_content in discovery_process.stdout:
             try:
                 obj = json.loads(line_content.strip())
-                if obj.get("id"):
-                    raw_video_list.append({"id": obj["id"], "title": obj.get("title", "N/A")})
-                    sys.stdout.write(f"\r  {ICON_WAIT}  {BCYAN}IDs encontrados: {len(raw_video_list)}{RESET}")
-                    sys.stdout.flush()
-            except: continue
+                video_id = obj.get("id")
+                if not video_id:
+                    continue
+
+                title = obj.get("title") or obj.get("fulltitle") or "N/A"
+
+                # Tentar extrair data do índice flat-playlist (evita Fase 2 para a maioria)
+                raw_date = obj.get("upload_date") or ""
+                if not raw_date:
+                    # Alguns canais expõem timestamp unix
+                    ts = obj.get("timestamp")
+                    if ts:
+                        raw_date = datetime.utcfromtimestamp(int(ts)).strftime("%Y%m%d")
+                publish_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}" if len(str(raw_date)) == 8 else "N/A"
+
+                raw_video_list.append({"id": video_id, "title": title, "publish_date": publish_date})
+                sys.stdout.write(
+                    f"\r  {ICON_WAIT}  {BCYAN}IDs encontrados: {len(raw_video_list)}{RESET}"
+                )
+                sys.stdout.flush()
+            except Exception:
+                continue
         discovery_process.wait()
     except Exception as error_msg:
         print()
         print_warn(f"Erro na descoberta: {error_msg}")
         return []
-        
+
+    print()
+
     if not raw_video_list:
-        print()
         print_warn("Nenhum vídeo encontrado para mapear state JSON.")
         return []
-        
-    total_videos_count = len(raw_video_list)
-    final_metadata_list = []
-    print()
-    print_info(f"Fase 2: Extração de Metadados em Paralelo ({BOLD}{max_workers_count} threads{RESET})...")
-    
-    start_time_float = time.time()
-    with ThreadPoolExecutor(max_workers=max_workers_count) as executor_instance:
-        future_tasks_dict = {
-            executor_instance.submit(get_video_exact_date, video_dict["id"], yt_dlp_cmd_list, cookie_args_list): video_dict 
-            for video_dict in raw_video_list
+
+    # Verificar quantos precisam de Fase 2 (data ausente no índice)
+    needs_date_list = [v for v in raw_video_list if v["publish_date"] == "N/A"]
+    has_dates_count = len(raw_video_list) - len(needs_date_list)
+    print_ok(f"Fase 1 completa: {has_dates_count}/{len(raw_video_list)} com data no índice.")
+
+    # Fase 2 — fallback paralelo apenas pra quem não tem data
+    if needs_date_list:
+        workers = min(max_workers_count, len(needs_date_list))
+        print_info(f"Fase 2: buscando {len(needs_date_list)} datas ausentes ({workers} threads)...")
+        start_time_float = time.time()
+        fetched_count = 0
+        total_fetch = len(needs_date_list)
+        id_to_entry = {v["id"]: v for v in raw_video_list}
+
+        with ThreadPoolExecutor(max_workers=workers) as executor_instance:
+            future_tasks_dict = {
+                executor_instance.submit(get_video_exact_date, v["id"], yt_dlp_cmd_list, cookie_args_list): v["id"]
+                for v in needs_date_list
+            }
+            for future_task in as_completed(future_tasks_dict):
+                result = future_task.result()
+                entry = id_to_entry.get(result["id"])
+                if entry:
+                    entry["publish_date"] = result["date"]
+                    if entry["title"] in ("N/A", "", None):
+                        entry["title"] = result["title"]
+                fetched_count += 1
+                elapsed = time.time() - start_time_float
+                rate = fetched_count / elapsed if elapsed > 0 else 0
+                remaining = int((total_fetch - fetched_count) / rate) if rate > 0 else 0
+                eta_str = f"{remaining // 60}m {remaining % 60}s" if remaining >= 60 else f"{remaining}s"
+                sys.stdout.write(
+                    f"\r  {ICON_DL}  {GREEN}Fase 2: {fetched_count}/{total_fetch}{RESET}"
+                    f" ({rate:.1f} v/s)  {YELLOW}ETA: {eta_str}{RESET}    "
+                )
+                sys.stdout.flush()
+        sys.stdout.write("\r\x1b[K")
+        sys.stdout.flush()
+        print_ok(f"Fase 2 completa em {int(time.time() - start_time_float)}s.")
+
+    # Montar lista final preservando a ordem original do flat-playlist
+    return [
+        {
+            "video_id": v["id"],
+            "publish_date": v["publish_date"],
+            "title": v["title"],
+            "subtitle_downloaded": False,
+            "info_downloaded": False,
+            "has_no_subtitle": False,
         }
-        for future_task in as_completed(future_tasks_dict):
-            result_dict = future_task.result()
-            final_metadata_list.append({
-                "video_id": result_dict["id"],
-                "publish_date": result_dict["date"],
-                "title": result_dict["title"],
-                "subtitle_downloaded": False,
-                "info_downloaded": False,
-                "has_no_subtitle": False
-            })
-            processed_count = len(final_metadata_list)
-            elapsed_time_float = time.time() - start_time_float
-            items_per_second_float = processed_count / elapsed_time_float if elapsed_time_float > 0 else 0
-            remaining_seconds = int((total_videos_count - processed_count) / items_per_second_float) if items_per_second_float > 0 else 0
-            eta_min = remaining_seconds // 60
-            eta_sec = remaining_seconds % 60
-            eta_str = f"{eta_min}m {eta_sec}s" if eta_min > 0 else f"{eta_sec}s"
-            
-            sys.stdout.write(
-                f"\r  {ICON_DL}  {GREEN}Processado: {processed_count}/{total_videos_count}{RESET} "
-                f"({items_per_second_float:.1f} video/s) "
-                f"{YELLOW}ETA: {eta_str}{RESET}    "
-            )
-            sys.stdout.flush()
-            
-    # Restaurar ordem cronológica invertida da flat playlist
-    id_to_order_dict = {v["id"]: i for i, v in enumerate(raw_video_list)}
-    final_metadata_list.sort(key=lambda x: id_to_order_dict.get(x["video_id"], 999999))
-    
-    sys.stdout.write("\r\x1b[K")
-    sys.stdout.flush()
-    print_ok(f"Mapeamento completo em {int(time.time() - start_time_float)} segundos.")
-    return final_metadata_list
+        for v in raw_video_list
+    ]
 
 
 def get_latest_json_path(cwd_path: Path, channel_name_safe: str | None = None) -> Path | None:
@@ -617,36 +655,7 @@ SUBTITLE_TIMESTAMP_REGEX_PATTERN = re.compile(
 )
 
 
-def srt_to_txt(srt_file_path: Path) -> Path:
-    """
-    Converte um arquivo .srt em .txt limpo (sem timestamps, sem numeração).
-    Deduplica linhas roll-up consecutivas geradas pelo YouTube.
-    Retorna o caminho do .txt gerado.
-    """
-    cleaned_lines_list: list[str] = []
-    previous_subtitle_line = ""
 
-    with open(srt_file_path, encoding="utf-8", errors="replace") as file_descriptor:
-        for raw_subtitle_line in file_descriptor:
-            raw_subtitle_line = raw_subtitle_line.strip()
-            # Pula linhas vazias, índices numéricos e timestamps
-            if not raw_subtitle_line or SUBTITLE_INDEX_REGEX_PATTERN.match(raw_subtitle_line) or SUBTITLE_TIMESTAMP_REGEX_PATTERN.match(raw_subtitle_line):
-                continue
-            # Remove tags HTML/XML (<i>, </i>, <font> etc.)
-            cleaned_subtitle_line = re.sub(r"<[^>]+>", "", raw_subtitle_line).strip()
-            if not cleaned_subtitle_line:
-                continue
-            # Deduplica roll-up: pula linha se idêntica à anterior
-            if cleaned_subtitle_line == previous_subtitle_line:
-                continue
-            cleaned_lines_list.append(cleaned_subtitle_line)
-            previous_subtitle_line = cleaned_subtitle_line
-
-    txt_file_path = srt_file_path.with_suffix(".txt")
-    with open(txt_file_path, "w", encoding="utf-8") as file_descriptor:
-        file_descriptor.write("\n".join(cleaned_lines_list) + "\n")
-
-    return txt_file_path
 
 
 # ─── Marcadores de Discurso Oral (Complemento ao NLTK) ────────────────────────
@@ -673,29 +682,58 @@ ORAL_MARKERS_ES = {
     "eh", "ah", "uh", "mira", "venga", "oye"
 }
 
-def get_merged_stopwords(lang_code: str, nltk_stopwords) -> set[str]:
-    """Retorna o set de stopwords fundindo NLTK com marcadores orais locais."""
+# ─── Cache de dependências de ML ─────────────────────────────────────────────
+
+@functools.lru_cache(maxsize=1)
+def _load_ml_deps():
+    """
+    Importa as dependências de ML (pysrt, sklearn, nltk) uma única vez por processo.
+    O resultado é cacheado via @lru_cache, garantindo que o tempo de importação
+    pesado só ocorra no primeiro download ou na primeira re-geração de MD.
+    """
+    try:
+        import pysrt
+        import numpy as np
+        import nltk
+        from nltk.corpus import stopwords as nltk_stopwords
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+        return pysrt, np, nltk, nltk_stopwords, TfidfVectorizer, cosine_similarity
+    except ImportError:
+        return None
+
+
+@functools.lru_cache(maxsize=8)
+def get_merged_stopwords(lang_code: str) -> frozenset:
+    """
+    Retorna o frozenset de stopwords (NLTK + marcadores orais) para o idioma.
+    O cache via @lru_cache evita a re-geração do set e o re-acesso ao NLTK 
+    durante o loop de múltiplos vídeos.
+    """
+    deps = _load_ml_deps()
+    if deps is None:
+        return frozenset()
+    _, _, nltk, nltk_stopwords, _, _ = deps
+
     nltk_lang_map = {
         "pt": ("portuguese", ORAL_MARKERS_PT),
         "en": ("english",    ORAL_MARKERS_EN),
         "es": ("spanish",    ORAL_MARKERS_ES)
     }
 
-    prefix = lang_code[:2] if lang_code else "pt" # Default fallback
+    prefix = lang_code[:2] if lang_code else "pt"
     if prefix not in nltk_lang_map:
         prefix = "pt"
 
     nltk_lang_name, oral_markers = nltk_lang_map[prefix]
-    
+
     try:
         base_stopwords = set(nltk_stopwords.words(nltk_lang_name))
     except LookupError:
-        # Tenta baixar silenciosamente se faltar
-        import nltk
         nltk.download('stopwords', quiet=True)
         base_stopwords = set(nltk_stopwords.words(nltk_lang_name))
 
-    return base_stopwords | oral_markers
+    return frozenset(base_stopwords | oral_markers)
 
 def srt_to_md(
     srt_path: Path,
@@ -707,26 +745,21 @@ def srt_to_md(
 ) -> Path | None:
     """
     Converte um arquivo .srt em .md estruturado com segmentação por tópicos (TF-IDF).
-    As dependências de ML são importadas de forma preguiçosa (lazy) para não impactar
-    o tempo de boot do CLI para quem não for usar a função --md.
+    Depêndencias de ML são carregadas via `_load_ml_deps()` e cacheadas por processo,
+    eliminando overhead de import nas chamadas subsequentes.
     """
-    try:
-        import pysrt
-        import numpy as np
-        import nltk
-        from nltk.corpus import stopwords as nltk_stopwords
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.metrics.pairwise import cosine_similarity
-    except ImportError:
-        print_err("Faltam dependências de ML (pysrt, sklearn, nltk) para MD. Instale-as ou rode com --no-md", indentation_prefix)
+    deps = _load_ml_deps()
+    if deps is None:
+        print_err("Faltam depêndencias de ML (pysrt, sklearn, nltk) para MD. Instale-as ou rode com --no-md", indentation_prefix)
         return None
+    pysrt, np, _nltk, _nltk_sw, TfidfVectorizer, cosine_similarity = deps
 
     try:
         subs = pysrt.open(str(srt_path), encoding='utf-8')
         if not subs:
             return None
 
-        # ── Fase 1: Janelas adaptativas ('à duração total do vídeo) ─────────────
+        # ── Fase 1: Janelas adaptativas (à duração total do vídeo) ─────────────
         total_duration_s = (
             subs[-1].end.hours * 3600 +
             subs[-1].end.minutes * 60 +
@@ -820,7 +853,7 @@ def srt_to_md(
         if lang_match:
             lang_code = lang_match.group(1).lower()
         
-        oral_stopwords = get_merged_stopwords(lang_code, nltk_stopwords)
+        oral_stopwords = get_merged_stopwords(lang_code)
 
         # ── Fase 2: Detecção de mudanças de tópico via TF-IDF ──────────────
         vectorizer = TfidfVectorizer(stop_words=list(oral_stopwords), min_df=1)
@@ -1051,7 +1084,6 @@ def cleanup_subtitles(
     channel_dir_name: str,
     video_id: str,
     video_title: str = "Vídeo Sem Título",
-    convert_srt_to_txt: bool = False,
     convert_srt_to_md: bool = False,
     flag_keep_srt: bool = False,
     indentation_prefix: str = "  ",
@@ -1060,8 +1092,7 @@ def cleanup_subtitles(
     Remove variações duplicadas de legenda geradas pelo yt-dlp,
     mantendo apenas o arquivo com o menor nome (ex: prefere 'pt' sobre 'pt-BR').
     Renomeia de '.pt.srt' para '-pt.srt'.
-    Se convert_srt_to_txt=True, converte para .txt.
-    Se convert_srt_to_md=True, Apenas retorna o Path para processamento posterior.
+    Se convert_srt_to_md=True, retorna o Path para processamento MD posterior.
     Retorna (True, Path) se processou alguma legenda, caso contrário (False, None).
     """
     subtitle_file_pattern = str(cwd_path / f"{channel_dir_name}-{video_id}*.srt")
@@ -1090,22 +1121,11 @@ def cleanup_subtitles(
         target_subtitle_file_path.rename(new_subtitle_filename_path)
         target_subtitle_file_path = new_subtitle_filename_path
 
-    # Conversão SRT → TXT limpo
-    if convert_srt_to_txt:
-        txt_file_path = srt_to_txt(target_subtitle_file_path)
-        print_info(f"Texto salvo: {DIM}{txt_file_path.name}{RESET}", indentation_prefix)
-        
     # Conversão SRT → MD é delegada para o final do loop principal
-    # para não travar o processo de download sequencial
-
-    # Lidando com o arquivo .srt original após conversões
-    if convert_srt_to_txt and not convert_srt_to_md and not flag_keep_srt:
-        target_subtitle_file_path.unlink()
-    elif convert_srt_to_txt or convert_srt_to_md:
+    if convert_srt_to_md:
         print_info(f"SRT mantido temp: {DIM}{target_subtitle_file_path.name}{RESET}", indentation_prefix)
     else:
-        if not convert_srt_to_md and not flag_keep_srt:
-             print_info(f"Legenda salva: {DIM}{target_subtitle_file_path.name}{RESET}", indentation_prefix)
+        print_info(f"Legenda salva: {DIM}{target_subtitle_file_path.name}{RESET}", indentation_prefix)
 
     return True, target_subtitle_file_path
 
@@ -1204,8 +1224,7 @@ def parse_args() -> argparse.Namespace:
             "Baixa legendas de todos os vídeos de um canal ou playlist do YouTube.\n"
             f"Versão: {VERSION}\n\n"
             "Padrão de nome dos arquivos: [NOME_DA_PASTA]-[ID_VIDEO]-[LANG].srt\n"
-            "Vídeos que não contêm legendas são registrados em 'videos_sem_legenda.txt'\n"
-            "na pasta do canal e serão automaticamente ignorados nas próximas execuções."
+            "Vídeos sem legenda são registrados no JSON de estado e ignorados automaticamente."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1214,14 +1233,12 @@ def parse_args() -> argparse.Namespace:
                         help="Idioma das legendas (ex: pt, en). Padrão: idioma nativo do canal")
     cli_parser.add_argument("-a", "--audio-only", action="store_true",
                         help="Baixa APENAS o áudio do vídeo (webm/opus), sem legendas")
-    cli_parser.add_argument("-t", "--txt", action="store_true",
-                        help="Exporta legendas como .txt limpo (sem timestamps). Remove o .srt por padrão")
     cli_parser.add_argument("-m", "--md", action="store_true", default=True,
                         help="Exporta legendas em .md segmentado por IA via TF-IDF (Padrão: Ativo)")
     cli_parser.add_argument("--no-md", action="store_false", dest="md",
                         help="Desativa a exportação em .md")
     cli_parser.add_argument("--keep-srt", action="store_true",
-                        help="Mantém o arquivo .srt ao usar --txt (gera ambos .srt e .txt)")
+                        help="Mantém o arquivo .srt no disco após a conversão para .md")
     cli_parser.add_argument("--audio-fallback", action="store_true",
                         help="Baixa o áudio quando a legenda não está disponível (padrão: apenas registra)")
     cli_parser.add_argument("-d", "--date", default="", metavar="DATA",
@@ -1232,6 +1249,8 @@ def parse_args() -> argparse.Namespace:
                         help="Pula a auto-recuperação de datas e títulos ausentes no histórico JSON")
     cli_parser.add_argument("-f", "--fast", action="store_true",
                         help="Modo rápido: pula o tempo de espera entre downloads")
+    cli_parser.add_argument("--regen-md", action="store_true",
+                        help="Modo offline: regenera .md a partir de todos os .srt na pasta atual (não faz downloads)")
     cli_parser.add_argument("-v", "--version", action="version", version=f"Versão: {VERSION}")
     return cli_parser.parse_args()
 
@@ -1308,8 +1327,8 @@ def setup_session(cli_args: argparse.Namespace) -> SessionConfig:
     channel_url_string, input_type_string, single_video_id = parse_input_type(channel_input_string)
 
     # Modo de operação para o header
-    file_format_string = "TXT" if cli_args.txt else "SRT"
-    execution_mode_label = "Áudio" if cli_args.audio_only else f"Legendas/{file_format_string} ({cli_args.lang or 'auto'})"
+    md_label = "+MD" if cli_args.md else ""
+    execution_mode_label = "Áudio" if cli_args.audio_only else f"Legendas/SRT{md_label} ({cli_args.lang or 'auto'})"
     if cli_args.date:
         execution_mode_label += f"  ·  a partir de {cli_args.date}"
     if cli_args.fast:
@@ -1407,8 +1426,21 @@ def process_videos(
     print_section(f"Download  {DIM}(0/{total_videos_count}){RESET}")
 
     # ─── Loop principal ────────────────────────────────────────────────────────
+    # O processamento é incremental. Para cada vídeo, verificamos se já está no JSON.
+    # Novas entradas disparam persistência periódica (_dirty counter) para poupar I/O.
     was_interrupted = False
-    
+
+    # ─── Flush periódico do JSON ─────────────────────────────────────────────
+    FLUSH_EVERY = 5  # salva a cada N mutações de estado
+    _dirty = 0       # contador de mudanças pendentes
+
+    def _flush(force: bool = False) -> None:
+        """Salva o JSON se o contador atingiu o limite ou se force=True."""
+        nonlocal _dirty
+        if force or _dirty >= FLUSH_EVERY:
+            save_channel_state_json(json_state_path, full_state_list)
+            _dirty = 0
+
     pending_md_conversions = []
 
     try:
@@ -1428,7 +1460,8 @@ def process_videos(
                     video_dict["publish_date"] = recovered_meta_dict["date"]
                     meta_updated_flag = True
                 if meta_updated_flag:
-                    save_channel_state_json(json_state_path, full_state_list)
+                    _dirty += 1
+                    _flush(force=True)  # auto-healing: salva imediatamente
                     print_ok(f"metadados atualizados via auto-healing", sub_indent_space)
 
             # 1. Verificação instantânea no JSON de estado do canal
@@ -1444,10 +1477,9 @@ def process_videos(
 
             # Verificação por arquivos em disco (caso o histórico esteja dessincronizado)
             is_srt_file_present = bool(glob.glob(str(session_config.cwd_path / f"{session_config.channel_dir_name}-{video_id}*.srt")))
-            is_txt_file_present = bool(glob.glob(str(session_config.cwd_path / f"{session_config.channel_dir_name}-{video_id}*.txt")))
             is_md_file_present  = bool(glob.glob(str(session_config.cwd_path / f"{session_config.channel_dir_name}-{video_id}*.md")))
 
-            if is_srt_file_present or is_txt_file_present or is_md_file_present:
+            if is_srt_file_present or is_md_file_present:
                 # Se existe .srt mas NÃO existe .md, e MD está ativo → agenda conversão
                 if is_srt_file_present and not is_md_file_present and cli_args.md:
                     srt_glob = glob.glob(str(session_config.cwd_path / f"{session_config.channel_dir_name}-{video_id}*.srt"))
@@ -1465,7 +1497,8 @@ def process_videos(
                 skipped_videos_count += 1
                 video_dict["info_downloaded"] = True
                 video_dict["subtitle_downloaded"] = True
-                save_channel_state_json(json_state_path, full_state_list)
+                _dirty += 1
+                _flush()
                 continue
 
             execution_mode_string = "ÁUDIO" if cli_args.audio_only else f"legenda/{language_opt_string}"
@@ -1487,7 +1520,8 @@ def process_videos(
                     video_id, video_dict
                 )
                 video_dict["info_downloaded"] = True
-                save_channel_state_json(json_state_path, full_state_list)
+                _dirty += 1
+                _flush()
 
                 has_downloaded_subtitle_flag = True
                 srt_path_ret = None
@@ -1495,7 +1529,6 @@ def process_videos(
                     has_downloaded_subtitle_flag, srt_path_ret = cleanup_subtitles(
                         session_config.cwd_path, session_config.channel_dir_name, video_id,
                         video_title=video_dict.get("title", "Sem Título"),
-                        convert_srt_to_txt=cli_args.txt,
                         convert_srt_to_md=cli_args.md,
                         flag_keep_srt=cli_args.keep_srt,
                         indentation_prefix=sub_indent_space
@@ -1548,7 +1581,8 @@ def process_videos(
 
                     if is_old_enough_flag:
                         video_dict["has_no_subtitle"] = True
-                        save_channel_state_json(json_state_path, full_state_list)
+                        _dirty += 1
+                        _flush()  # marca como sem legenda — flush imediato
                     else:
                         print_info(f"vídeo recente ({days_ago_count}d) — não marcado como sem legenda", sub_indent_space)
 
@@ -1560,7 +1594,8 @@ def process_videos(
                     # Marcar o estado JSON se baixamos a legenda
                     if not cli_args.audio_only and has_downloaded_subtitle_flag:
                         video_dict["subtitle_downloaded"] = True
-                        save_channel_state_json(json_state_path, full_state_list)
+                        _dirty += 1
+                        _flush()
                         
                     if not cli_args.fast:
                         sleep_duration_seconds = random.randint(1, 5)
@@ -1578,6 +1613,7 @@ def process_videos(
         print()
         print_warn(f"Processamento interrompido. {DIM}Gerando resumo parcial...{RESET}")
         was_interrupted = True
+        _flush(force=True)  # garante que nenhuma mutação pendente seja perdida
 
     # ---------- Processamento Deferido de MD --------------
     if pending_md_conversions:
@@ -1611,8 +1647,99 @@ def print_summary(downloaded_videos_count: int, skipped_videos_count: int, error
     print()
 
 
+def regen_md_from_srt_files() -> None:
+    """Modo offline: varre archive/ e depois a pasta atual buscando .srt e regenera .md via TF-IDF."""
+    cwd_path = Path.cwd()
+    archive_path = cwd_path / "archive"
+
+    # Montar lista de (srt_path, origem_label) varrendo archive/ primeiro, depois cwd
+    scan_dirs = []
+    if archive_path.is_dir():
+        scan_dirs.append((archive_path, "archive/"))
+    scan_dirs.append((cwd_path, "./"))
+
+    srt_files_list: list[tuple[Path, str]] = []
+    for scan_dir, label in scan_dirs:
+        for srt in sorted(scan_dir.glob("*.srt")):
+            srt_files_list.append((srt, label))
+
+    if not srt_files_list:
+        print_err("Nenhum arquivo .srt encontrado em archive/ ou na pasta atual.")
+        sys.exit(1)
+
+    # Carregar JSON de estado uma única vez
+    json_state_path = get_latest_json_path(cwd_path)
+    videos_lookup_dict: dict[str, str] = {}
+    if json_state_path and json_state_path.is_file():
+        try:
+            with open(json_state_path, "r", encoding="utf-8") as f:
+                json_data = json.load(f)
+                videos_list = json_data.get("videos", json_data) if isinstance(json_data, dict) else json_data
+                for v in videos_list:
+                    vid = v.get("video_id", "")
+                    if vid:
+                        videos_lookup_dict[vid] = v.get("title", "")
+        except Exception:
+            pass
+
+    print_header(cwd_path.name, VERSION, "Regeneração MD offline")
+
+    total_count = len(srt_files_list)
+    converted_count = 0
+    skipped_count = 0
+    current_label = ""
+
+    for idx, (srt_path, origin_label) in enumerate(srt_files_list, start=1):
+        # Imprimir seção ao trocar de diretório
+        if origin_label != current_label:
+            current_label = origin_label
+            section_files = sum(1 for _, l in srt_files_list if l == origin_label)
+            print_section(f"{origin_label}  {DIM}({section_files} arquivos .srt){RESET}")
+
+        indentation_prefix = f"  {BLUE}[{idx:>{len(str(total_count))}}/{total_count}]{RESET}"
+
+        # Extrair video_id do nome: <prefixo>-<VIDEO_ID>.<lang>.srt
+        stem_parts = srt_path.stem
+        video_id_match = re.search(r"([A-Za-z0-9_-]{11})", stem_parts)
+        video_id = video_id_match.group(1) if video_id_match else srt_path.stem
+
+        # Título via lookup
+        video_title = videos_lookup_dict.get(video_id, srt_path.stem)
+
+        # Verificar se .md já existe
+        md_path = srt_path.with_suffix(".md")
+        if md_path.exists():
+            print_skip(f"{srt_path.name}  {DIM}.md já existe — pulando{RESET}", indentation_prefix)
+            skipped_count += 1
+            continue
+
+        print_dl(f"{srt_path.name}{RESET}  {DIM}gerando .md{RESET}", indentation_prefix)
+        result_path = srt_to_md(srt_path, video_id, video_title, threshold=0.3, indentation_prefix="      ")
+
+        if result_path:
+            print_ok(f"salvo: {DIM}{result_path.name}{RESET}", "      ")
+            converted_count += 1
+        else:
+            print_warn(f"falha ou vazio", "      ")
+
+    # Resumo
+    print(f"\n{DIV_THICK}")
+    print(f"  {BOLD}{BWHITE}Regeneração concluída{RESET}")
+    print(f"{DIV_THICK}")
+    print(f"  {ICON_OK}  Convertidos : {BGREEN}{converted_count}{RESET}")
+    print(f"  {ICON_SKIP}  Pulados     : {DIM}{skipped_count}{RESET}")
+    print(f"  {ICON_INFO}  Total       : {total_count}")
+    print()
+
+
 def main() -> None:
     cli_args = parse_args()
+
+    # Short-circuit: modo offline de regeneração MD
+    if cli_args.regen_md:
+        regen_md_from_srt_files()
+        return
+
     session_config = setup_session(cli_args)
     cookie_args_list, language_opt_string = init_auth_and_language(
         session_config, cli_args.lang, cli_args.refresh_cookies
