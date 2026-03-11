@@ -40,6 +40,9 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 from dotenv import load_dotenv
+import warnings
+# Suprime avisos de dependência do requests (comum em venvs com versões desencontradas)
+warnings.filterwarnings("ignore", category=UserWarning, module="requests")
 import requests
 from collections import Counter
 
@@ -268,12 +271,15 @@ def filter_youtube_cookies(cookies_path: Path) -> None:
 
 # ─── Detecção de Idioma ───────────────────────────────────────────────────────
 
-def detect_language(yt_dlp_cmd_list: list[str], cookie_args_list: list[str], channel_url: str) -> str:
+def detect_language(yt_dlp_cmd_list: list[str], cookie_args_list: list[str], channel_url: str, cached_lang: str | None = None) -> str:
     """
-    Detecta o idioma predominante do canal analisando as primeiras entradas da playlist.
-    O método é robusto contra outliers: se houver um vídeo em idioma diferente, 
-    ele seleciona o que for mais frequente em uma amostragem de 5 vídeos.
+    Detecta o idioma predominante do canal. 
+    Se cached_lang for fornecido, usa ele imediatamente (Prioridade Local).
     """
+    if cached_lang and cached_lang != "N/A":
+        print_ok(f"Usando idioma em cache: {BOLD}{cached_lang.strip('^$')}{RESET}")
+        return cached_lang
+
     print_info("Detectando idioma nativo (amostragem de 5 vídeos)...")
     
     # 1. Carregar Idioma default do .env caso exista (Fallback Máximo)
@@ -317,6 +323,11 @@ def detect_language(yt_dlp_cmd_list: list[str], cookie_args_list: list[str], cha
             
             subprocess_result = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
             detected_languages = [lang.strip().lower() for lang in subprocess_result.stdout.splitlines() if lang.strip()]
+            
+        # Ignore invalid tags returned from yt-dlp when metadata is missing
+        invalid_tags = {"na", "n/a", "none", "null", "undefined"}
+        detected_languages = [l for l in detected_languages if l not in invalid_tags]
+
     except Exception as e:
         print_warn(f"Erro na rotina de detecção automática: {e}")
 
@@ -570,8 +581,9 @@ def load_or_create_channel_state(
     cwd_path: Path, 
     yt_dlp_cmd_list: list[str], 
     cookie_args_list: list[str], 
-    channel_url: str
-) -> tuple[Path | None, list[dict]]:
+    channel_url: str,
+    only_peek_lang: bool = False
+) -> tuple[Path | None, list[dict], str | None]:
     """
     Carrega o banco de dados JSON do canal e sincroniza com metadados locais.
     Realiza:
@@ -584,61 +596,166 @@ def load_or_create_channel_state(
     identifier = ""
     
     # Extração de identificador (Handle ou ID de Playlist ou ID de Vídeo)
-    if "@" in channel_url:
+    # Identificação de Canal para vídeos individuais: busca o uploader antes de definir o JSON
+    target_channel_id = None
+    target_uploader_id = None
+
+    if "watch?v=" in channel_url or "youtu.be/" in channel_url:
+        match = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", channel_url)
+        identifier = match.group(1) if match else "video"
+        
+        # 0. Verificação em cache local antes de chamar o YouTube
+        history_map = load_all_local_history(cwd_path)
+        if identifier in history_map:
+            hist_entry = history_map[identifier]
+            target_uploader_id = hist_entry.get("uploader_id")
+            target_channel_id = hist_entry.get("channel_id")
+            if target_uploader_id:
+                channel_name_safe = target_uploader_id.lstrip("@")
+                print_ok(f"Origem identificada (cache local): {BOLD}@{channel_name_safe}{RESET}")
+
+        if not channel_name_safe:
+            # Tenta descobrir o uploader sem baixar nada pesado
+            print_info(f"Identificando canal de origem para o vídeo {BOLD}{identifier}{RESET}...")
+            meta_cmd = yt_dlp_cmd_list + cookie_args_list + ["--dump-json", "--skip-download", f"https://www.youtube.com/watch?v={identifier}"]
+            try:
+                p = subprocess.run(meta_cmd, capture_output=True, text=True, timeout=15)
+                if p.stdout:
+                    video_meta = json.loads(p.stdout)
+                    target_uploader_id = video_meta.get("uploader_id")
+                    target_channel_id = video_meta.get("channel_id")
+                    
+                    if target_uploader_id:
+                        # Remove @
+                        channel_name_safe = target_uploader_id.lstrip("@")
+                        print_ok(f"Origem identificada: {BOLD}@{channel_name_safe}{RESET}")
+            except Exception:
+                pass
+            
+        if not channel_name_safe:
+            channel_name_safe = f"video_{identifier}"
+    elif "@" in channel_url:
         match = re.search(r"@([A-Za-z0-9_-]+)", channel_url)
         channel_name_safe = match.group(1) if match else "canal"
+        # Carregamos o histórico aqui também para uso posterior
+        history_map = load_all_local_history(cwd_path)
     elif "list=" in channel_url:
         match = re.search(r"list=([A-Za-z0-9_-]+)", channel_url)
         identifier = match.group(1) if match else "playlist"
-        channel_name_safe = f"playlist_{identifier}"
-    elif "watch?v=" in channel_url or "youtu.be/" in channel_url:
-        match = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", channel_url)
-        identifier = match.group(1) if match else "video"
-        channel_name_safe = f"video_{identifier}"
+        
+        # 0. Verificação em cache local para playlists
+        history_map = load_all_local_history(cwd_path)
+        for vid, entry in history_map.items():
+            if "playlists" in entry and identifier in entry["playlists"]:
+                target_uploader_id = entry.get("uploader_id")
+                target_channel_id = entry.get("channel_id")
+                if target_uploader_id:
+                    channel_name_safe = target_uploader_id.lstrip("@")
+                    print_ok(f"Dono da playlist identificado (cache local): {BOLD}@{channel_name_safe}{RESET}")
+                    break
+        
+        if not channel_name_safe:
+            # O mesmo escudo aplicado a vídeos avulsos, mas focando no índice 1 da playlist
+            print_info(f"Identificando canal dono da playlist {BOLD}{identifier}{RESET}...")
+            meta_cmd = yt_dlp_cmd_list + cookie_args_list + [
+                "--dump-json", "--flat-playlist", "--playlist-end", "1", 
+                "--ignore-errors", channel_url
+            ]
+            
+            try:
+                p = subprocess.run(meta_cmd, capture_output=True, text=True, timeout=15)
+                if p.stdout:
+                    # O flat-playlist cospe um JSON por linha de saída
+                    first_line = p.stdout.splitlines()[0]
+                    playlist_meta = json.loads(first_line)
+                    
+                    target_uploader_id = playlist_meta.get("uploader_id")
+                    target_channel_id = playlist_meta.get("channel_id")
+                    
+                    if target_uploader_id:
+                        channel_name_safe = target_uploader_id.lstrip("@")
+                        print_ok(f"Origem da playlist identificada: {BOLD}@{channel_name_safe}{RESET}")
+            except Exception:
+                pass
+            
+        if not channel_name_safe:
+            channel_name_safe = f"playlist_{identifier}"
+
     else:
         channel_name_safe = "canal"
 
-    # Seleção inteligente do JSON: se houver apenas um escriba_*.json na pasta, usa ele como corrente.
+    # Seleção inteligente do JSON
     json_path = None
-    existing_jsons = list(cwd_path.glob("escriba_*.json"))
-    if not existing_jsons:
-        existing_jsons = list(cwd_path.glob("lista_*.json"))
-        
-    if len(existing_jsons) == 1:
-        json_path = existing_jsons[0]
-        print_info(f"Usando JSON corrente detectado: {BOLD}{json_path.name}{RESET}")
-    elif len(existing_jsons) > 1:
-        # Tenta achar um que bata com o canal atual
-        for ej in existing_jsons:
-            if channel_name_safe in ej.name:
-                json_path = ej
-                break
-        if not json_path:
-            # Pega o mais recente como fallback
-            json_path = Path(max([str(j) for j in existing_jsons], key=os.path.getmtime))
-            print_info(f"Sincronizando com JSON mais recente: {BOLD}{json_path.name}{RESET}")
+    # 1. Tenta correspondência exata com o canal identificado
+    target_filename = f"escriba_{channel_name_safe}.json"
+    if (cwd_path / target_filename).exists():
+        json_path = cwd_path / target_filename
     else:
-        json_path = cwd_path / f"escriba_{channel_name_safe}.json"
+        # 2. Se houver apenas um escriba_*.json na pasta, usa ele (contexto de pasta única)
+        existing_jsons = list(cwd_path.glob("escriba_*.json"))
+        if not existing_jsons:
+            existing_jsons = list(cwd_path.glob("lista_*.json"))
+            
+        if len(existing_jsons) == 1:
+            json_path = existing_jsons[0]
+            print_info(f"Usando JSON corriente detectado: {BOLD}{json_path.name}{RESET}")
+        elif len(existing_jsons) > 1:
+            # Tenta achar um que bata com o canal atual
+            for ej in existing_jsons:
+                if channel_name_safe and channel_name_safe in ej.name:
+                    json_path = ej
+                    break
+            if not json_path:
+                # Pega o mais recente como fallback
+                json_path = Path(max([str(j) for j in existing_jsons], key=os.path.getmtime))
+                print_info(f"Sincronizando com JSON mais recente: {BOLD}{json_path.name}{RESET}")
+        else:
+            json_path = cwd_path / target_filename
 
-    # 1. Tenta carregar o histórico consolidado de TODOS os arquivos .json na pasta
-    # Isso atende ao requisito de verificar a data de publicação em arquivos locais.
-    history_map = load_all_local_history(cwd_path)
+    # Carregar/Identificar idioma persistente
+    detected_lang_cached = None
+    if json_path and json_path.exists():
+        try:
+            with open(json_path, "r", encoding="utf-8") as fd:
+                data = json.load(fd)
+                if isinstance(data, dict):
+                    detected_lang_cached = data.get("detected_language")
+        except Exception: pass
+
+    if only_peek_lang:
+        return json_path, [], detected_lang_cached
+
+    # 1. Carregar lista mestre do JSON alvo (se existir) para garantir preservação total
+    state_map: dict[str, dict] = {}
+    if json_path and json_path.exists():
+        try:
+            with open(json_path, "r", encoding="utf-8") as fd:
+                json_data = json.load(fd)
+                v_list = json_data["videos"] if isinstance(json_data, dict) and "videos" in json_data else json_data
+                if isinstance(v_list, list):
+                    for v in v_list:
+                        vid_id = v.get("video_id") or v.get("id")
+                        if vid_id:
+                            state_map[vid_id] = v
+            if state_map:
+                print_info(f"Base carregada: {BOLD}{len(state_map)}{RESET} vídeos preservados do banco de dados.")
+        except Exception: pass
+
+    # 2. Já carregamos history_map lá no início para identificação de canal
     
-    # 2. Buscar os vídeos da URL atual, passando o mapeamento local para evitar yt-dlp desnecessário
+    # 3. Buscar os vídeos da URL atual
     current_videos_list = generate_fast_list_json(yt_dlp_cmd_list, cookie_args_list, channel_url, local_history_map=history_map)
-    if not current_videos_list and not json_path.exists():
-        return None, []
+    if not current_videos_list and not state_map:
+        return None, [], detected_lang_cached
 
-    # 3. Merge: vídeos da playlist atual + informações de estado do histórico
-    merged_state_list = []
-    seen_ids = set()
+    # 4. Integrar novos vídeos descobertos
     new_videos_count = 0
     imported_count = 0
     
-    # Identificar canal alvo a partir do primeiro vídeo da lista atual (se houver)
-    target_channel_id = None
-    target_uploader_id = None
-    if current_videos_list:
+    playlist_ctx = identifier if "list=" in channel_url else None
+
+    # Se ainda não temos os IDs de canal/uploader, tenta pegar do primeiro vídeo da lista atual
+    if not target_channel_id and not target_uploader_id and current_videos_list:
         v0 = current_videos_list[0]
         v0_id = v0["video_id"]
         if v0_id in history_map:
@@ -650,76 +767,114 @@ def load_or_create_channel_state(
     # Adicionar vídeos da listagem atual do YouTube
     for vid_entry in current_videos_list:
         vid_id = vid_entry["video_id"]
-        seen_ids.add(vid_id)
         
-        if vid_id in history_map:
-            # Preservar o estado do histórico
-            existing_entry = history_map[vid_id].copy()
-            
-            # Garantir campos
-            for field in ["subtitle_downloaded", "info_downloaded", "has_no_subtitle"]:
-                if field not in existing_entry: existing_entry[field] = False
-            
-            # Atualizar título/data se vieram novos e o local for N/A
+        if vid_id in state_map:
+            # Já existe: atualizar metadados se os atuais forem fracos
+            existing = state_map[vid_id]
             if vid_entry.get("publish_date") and vid_entry["publish_date"] != "N/A":
-                existing_entry["publish_date"] = vid_entry["publish_date"]
+                if not existing.get("publish_date") or existing["publish_date"] == "N/A":
+                    existing["publish_date"] = vid_entry["publish_date"]
             if vid_entry.get("title") and vid_entry["title"] not in ("N/A", "", "Avulso"):
-                existing_entry["title"] = vid_entry["title"]
-
-            # Adicionar playlist se não constar
-            if playlist_ctx:
-                if "playlists" not in existing_entry: existing_entry["playlists"] = []
-                if playlist_ctx not in existing_entry["playlists"]:
-                    existing_entry["playlists"].append(playlist_ctx)
+                if not existing.get("title") or existing["title"] in ("N/A", "", "Avulso"):
+                    existing["title"] = vid_entry["title"]
             
-            merged_state_list.append(existing_entry)
+            # Mesclar playlists
+            if playlist_ctx:
+                if "playlists" not in existing: existing["playlists"] = []
+                if playlist_ctx not in existing["playlists"]:
+                    existing["playlists"].append(playlist_ctx)
         else:
+            # Novo vídeo
             if playlist_ctx: vid_entry["playlists"] = [playlist_ctx]
-            merged_state_list.append(vid_entry)
+            state_map[vid_id] = vid_entry
             new_videos_count += 1
 
     # 4. Importação Reversa: Vídeos que estão nos JSONs locais mas não apareceram na lista atual
-    # Isso atende ao pedido de "aproveitar arquivos .json locais e gravar no escriba-*.json"
     for vid_id, hist_entry in history_map.items():
-        if vid_id in seen_ids: continue
+        if vid_id in state_map: continue
         
-        # Heurística de importação:
-        # Se o canal bater OU se o uploader bater OU se o nome do canal (safe) estiver no uploader
+        # Heurística de importação por canal
         is_same_channel = False
         if target_channel_id and hist_entry.get("channel_id") == target_channel_id: is_same_channel = True
         elif target_uploader_id and hist_entry.get("uploader_id") == target_uploader_id: is_same_channel = True
         elif channel_name_safe and channel_name_safe.lower() in str(hist_entry.get("uploader", "")).lower(): is_same_channel = True
         
         if is_same_channel:
-            merged_state_list.append(hist_entry)
-            seen_ids.add(vid_id)
+            state_map[vid_id] = hist_entry.copy()
             imported_count += 1
 
+    final_results_list = list(state_map.values())
+    
     if new_videos_count > 0:
         print_ok(f"Descobertos {BOLD}{new_videos_count}{RESET} novos vídeos na URL alvo.")
     if imported_count > 0:
-        print_ok(f"Importados {BOLD}{imported_count}{RESET} vídeos a partir de JSONs locais ({DIM}offline{RESET}).")
+        print_ok(f"Importados {BOLD}{imported_count}{RESET} vídeos do histórico local.")
 
-    save_channel_state_json(json_path, merged_state_list)
-    return json_path, merged_state_list
+    return json_path, final_results_list, detected_lang_cached
 
 
-def save_channel_state_json(json_path: Path | None, state_list: list[dict], channel_handle: str | None = None):
-    """Atualiza atomicamente arquivo JSON em disco caso tenhamos modificado o tracker de download."""
-    if not json_path or not state_list:
+def save_channel_state_json(json_path: Path | None, videos_list: list[dict], channel_handle: str | None = None, detected_language: str | None = None):
+    """
+    Atualiza atomicamente arquivo JSON em disco. 
+    Garante deduplicação de video_id e preservação do idioma detectado.
+    """
+    if not json_path:
         return
         
+    # 1. Deduplicação e mesclagem final antes de salvar
+    dedup_map = {}
+    for v in videos_list:
+        vid_id = v.get("video_id") or v.get("id")
+        if not vid_id: continue
+        if vid_id not in dedup_map:
+            dedup_map[vid_id] = v.copy()
+        else:
+            existing = dedup_map[vid_id]
+            # Mesclar flags binárias (quem tem True vence)
+            for flag in ["subtitle_downloaded", "info_downloaded", "has_no_subtitle"]:
+                if v.get(flag): existing[flag] = True
+            
+            # Mesclar strings se o atual for fraco
+            if v.get("publish_date") and v["publish_date"] != "N/A":
+                if not existing.get("publish_date") or existing["publish_date"] == "N/A":
+                    existing["publish_date"] = v["publish_date"]
+            if v.get("title") and v["title"] not in ("N/A", "Avulso", ""):
+                if not existing.get("title") or existing["title"] in ("N/A", "Avulso", ""):
+                    existing["title"] = v["title"]
+            
+            # Mesclar playlists
+            if "playlists" in v:
+                if "playlists" not in existing: existing["playlists"] = []
+                for p in v["playlists"]:
+                    if p not in existing["playlists"]: existing["playlists"].append(p)
+
+    final_videos = list(dedup_map.values())
+
+    # 2. Determinar handle do canal
     if not channel_handle:
         match = re.search(r"(?:escriba_|lista_)(.+)\.json", json_path.name)
         if match:
             channel_handle = f"@{match.group(1)}"
             
-    output_data = state_list
-    if channel_handle:
-        output_data = {
-            "channel": channel_handle,
-            "videos": state_list
-        }
+    output_data = {
+        "channel": channel_handle if channel_handle else "N/A",
+        "videos": final_videos
+    }
+    
+    if detected_language:
+        output_data["detected_language"] = detected_language
+
+    # Tenta preservar campos existentes se não passamos novos (ex: idioma)
+    if json_path.exists():
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                old_data = json.load(f)
+                if isinstance(old_data, dict):
+                    if not channel_handle:
+                        output_data["channel"] = old_data.get("channel", output_data["channel"])
+                    if not detected_language and "detected_language" in old_data:
+                        output_data["detected_language"] = old_data["detected_language"]
+        except: pass
     
     # Force the path to strictly be the modern format if it isn't already
     target_write_path = json_path
@@ -1368,14 +1523,16 @@ def harvest_and_delete_info_json(
     channel_dir_name: str,
     video_id: str,
     video_dict: dict,
-) -> None:
+) -> bool:
     """
     Extrai metadados do arquivo .info.json (título, data, duração, views),
     atualiza o dicionário do vídeo em memória e remove o arquivo temporário.
     """
     info_json_path = cwd_path / f"{channel_dir_name}-{video_id}.info.json"
     if not info_json_path.exists():
-        return
+        return False
+    
+    harvested_flag = False
     try:
         with open(info_json_path, encoding="utf-8") as f:
             meta = json.load(f)
@@ -1392,13 +1549,17 @@ def harvest_and_delete_info_json(
             video_dict["channel"] = meta.get("channel") or meta.get("uploader")
         if not video_dict.get("view_count"):
             video_dict["view_count"] = meta.get("view_count")
+        
+        harvested_flag = True
     except Exception:
         pass
     finally:
         try:
-            info_json_path.unlink()
+            if info_json_path.exists():
+                info_json_path.unlink()
         except Exception:
             pass
+    return harvested_flag
 
 
 # ─── Argparse ─────────────────────────────────────────────────────────────────
@@ -1548,7 +1709,15 @@ def init_auth_and_language(
     cookie_args_list = configure_cookies(session_config.cwd_path, session_config.script_dir_path, force_refresh_cookies_flag)
 
     print_section("Idioma")
-    language_opt_string = language_argument_string if language_argument_string else detect_language(session_config.yt_dlp_cmd_list, cookie_args_list, session_config.channel_url)
+    # Tenta obter cache antes de detectar
+    _, _, cached_lang = load_or_create_channel_state(
+        session_config.cwd_path, session_config.yt_dlp_cmd_list, cookie_args_list, session_config.channel_url,
+        only_peek_lang=True
+    )
+
+    language_opt_string = language_argument_string if language_argument_string else detect_language(
+        session_config.yt_dlp_cmd_list, cookie_args_list, session_config.channel_url, cached_lang
+    )
     if language_argument_string:
         print_ok(f"Idioma definido pelo usuário: {BOLD}{language_opt_string}{RESET}")
 
@@ -1586,32 +1755,37 @@ def process_videos(
     """
     # Detectar se é vídeo avulso
     _, input_type_string, single_video_id = parse_input_type(session_config.channel_input_url_or_handle)
-    is_single_video_mode = False
-
+    
+    print_section("Listagem de Vídeos e Tracking State")
+    json_state_path, full_state_list, detected_lang_cached = load_or_create_channel_state(
+        session_config.cwd_path, session_config.yt_dlp_cmd_list, cookie_args_list, session_config.channel_url
+    )
+    
+    # Garantir que o idioma detectado esteja no arquivo caso tenha sido descoberto agora
+    if language_opt_string and language_opt_string != detected_lang_cached:
+        save_channel_state_json(json_state_path, full_state_list, detected_language=language_opt_string)
+    
+    # Se o modo for vídeo único, filtramos a lista carregada para focar apenas nele
     if input_type_string == "video" and single_video_id:
-        print_section("Vídeo Avulso")
         is_single_video_mode = True
-        json_state_path = None
-        full_state_list = None
+        working_state_list = [v for v in full_state_list if v["video_id"] == single_video_id]
         
-        # Recuperar metadados de qualquer JSON local se disponível
-        local_hist = load_all_local_history(session_config.cwd_path)
-        hist_entry = local_hist.get(single_video_id, {})
+        # Se não estiver no canal (vídeo novo), adiciona na mão para processar
+        if not working_state_list:
+            new_entry = {
+                "video_id": single_video_id, 
+                "publish_date": "N/A", 
+                "title": "Avulso", 
+                "subtitle_downloaded": False,
+                "info_downloaded": False,
+                "has_no_subtitle": False,
+            }
+            full_state_list.append(new_entry)
+            working_state_list = [new_entry]
         
-        working_state_list = [{
-            "video_id": single_video_id, 
-            "publish_date": hist_entry.get("publish_date", "N/A"), 
-            "title": hist_entry.get("title", "Avulso"), 
-            "subtitle_downloaded": hist_entry.get("subtitle_downloaded", False),
-            "info_downloaded": hist_entry.get("info_downloaded", False),
-            "has_no_subtitle": hist_entry.get("has_no_subtitle", False),
-        }]
-        print_info(f"Processando vídeo: {BOLD}{single_video_id}{RESET}")
+        print_info(f"Foco em vídeo único: {BOLD}{single_video_id}{RESET}")
     else:
-        print_section("Listagem de Vídeos e Tracking State")
-        json_state_path, full_state_list = load_or_create_channel_state(
-            session_config.cwd_path, session_config.yt_dlp_cmd_list, cookie_args_list, session_config.channel_url
-        )
+        is_single_video_mode = False
         working_state_list = filter_state_list(full_state_list, cli_args.date)
 
     if not working_state_list:
@@ -1644,7 +1818,7 @@ def process_videos(
         """Salva o JSON se o contador atingiu o limite ou se force=True."""
         nonlocal _dirty
         if force or _dirty >= FLUSH_EVERY:
-            save_channel_state_json(json_state_path, full_state_list)
+            save_channel_state_json(json_state_path, full_state_list, detected_language=language_opt_string)
             _dirty = 0
 
     pending_md_conversions = []
@@ -1703,33 +1877,37 @@ def process_videos(
                 audio_only_flag=cli_args.audio_only,
             )
 
-            if download_exit_code == 0:
-                # Harvest: absorver metadados do .info.json no state JSON e deletar o arquivo
-                harvest_and_delete_info_json(
-                    session_config.cwd_path, session_config.channel_dir_name,
-                    video_id, video_dict
-                )
-                video_dict["info_downloaded"] = True
-                _dirty += 1
-                
-                # 0. Auto-healing de metadados no JSON de estado
-                # Só roda após confirmar que o vídeo precisa ser e foi baixado.
-                if not cli_args.ignore_metadata and input_type_string != "video" and (video_dict.get("title", "N/A") == "N/A" or video_dict.get("publish_date", "N/A") == "N/A"):
+            # --- Harvest: Absorver metadados independente do exit code (ex: sem legenda gera erro mas tem info) ---
+            info_harvested = harvest_and_delete_info_json(
+                session_config.cwd_path, session_config.channel_dir_name,
+                video_id, video_dict
+            )
+            
+            # --- Auto-healing: Backup caso o harvest tenha falhado ou retornado metadados vazios ---
+            if not cli_args.ignore_metadata:
+                if video_dict.get("title", "N/A") == "N/A" or video_dict.get("publish_date", "N/A") == "N/A":
+                    # Só tenta auto-healing se o harvest falhou ou se os dados ainda são N/A
                     print_info(f"{video_id}  {DIM}recuperando metadados ausentes (título/data)...{RESET}", indentation_prefix)
                     recovered_meta_dict = get_video_exact_date(video_id, session_config.yt_dlp_cmd_list, cookie_args_list)
                     meta_updated_flag = False
+                    
                     if recovered_meta_dict["title"] != "N/A" and video_dict.get("title", "N/A") == "N/A":
                         video_dict["title"] = recovered_meta_dict["title"]
                         meta_updated_flag = True
                     if recovered_meta_dict["date"] != "N/A" and video_dict.get("publish_date", "N/A") == "N/A":
                         video_dict["publish_date"] = recovered_meta_dict["date"]
                         meta_updated_flag = True
+                    
                     if meta_updated_flag:
-                        _dirty += 1
+                        info_harvested = True
                         print_ok(f"metadados atualizados via auto-healing", sub_indent_space)
 
-                _flush()
+            if info_harvested:
+                video_dict["info_downloaded"] = True
+                _dirty += 1
+                _flush() # Garante persistência imediata de metadados básicos
 
+            if download_exit_code == 0:
                 has_downloaded_subtitle_flag = True
                 srt_path_ret = None
                 if not cli_args.audio_only:
@@ -1775,14 +1953,14 @@ def process_videos(
 
                     skipped_videos_count += 1
 
-                    # Só marca como "sem legenda" se o vídeo tem mais de 30 dias
+                    # Só marca como "sem legenda" se o vídeo tem mais de 7 dias
                     is_old_enough_flag = True  # fallback: marca se não conseguir ler a data
                     publish_date_string = video_dict.get("publish_date", "N/A")
                     if publish_date_string != "N/A":
                         try:
                             publish_datetime_object = datetime.strptime(publish_date_string, "%Y-%m-%d")
                             days_ago_count = (datetime.now() - publish_datetime_object).days
-                            is_old_enough_flag = days_ago_count > 30
+                            is_old_enough_flag = days_ago_count > 7
                         except ValueError:
                             pass
 
@@ -1815,6 +1993,9 @@ def process_videos(
                 if not cli_args.fast:
                     print_countdown(300, "Resfriamento", sub_indent_space)
                 print_info("Retomando...", sub_indent_space)
+
+        # Flush final após o loop para garantir persistência de todos os status da sessão
+        _flush(force=True)
 
     except KeyboardInterrupt:
         print()
